@@ -1,0 +1,140 @@
+import os
+import re
+import rasterio
+import numpy as np
+import cv2
+from torch.utils.data import Dataset
+
+
+class LRHRDataSet(Dataset):
+    def __init__(self, data_root="sr_data", mode="train", indices=None):
+        self.mode = mode
+        self.lr_root = os.path.join(data_root, "LR")
+        self.hr_root = os.path.join(data_root, "HR", "VV")
+        self.angle_root = os.path.join(data_root, "IncAngle")
+        self.ewc_root = os.path.join(data_root, "EWC")
+        self.dem_root = os.path.join(data_root, "DEM")
+
+        self.samples = []  # list of (lr_path, hr_path, angle_path, lc_path, dem_path)
+        self.build_samples()
+        if indices is None:
+            self.samples = np.array(self.samples)
+        else:
+            self.samples = np.array(self.samples)[indices]
+
+    def extract_timestamp(self, filename):
+        """Extract date string from filename (format: 20170522 or similar)."""
+        match = re.search(r"(20\d{6})", filename)
+        return match.group(1) if match else None
+
+    def build_samples(self):
+        for region_folder in sorted(os.listdir(self.lr_root)):
+            # Skip if it's not a directory
+            if not os.path.isdir(os.path.join(self.lr_root, region_folder)):
+                continue
+            region = region_folder.replace("-SMAP", "")
+            # lr_dir = os.path.join(self.ewc_root, region_folder)
+            lr_dir = os.path.join(self.lr_root, region_folder)
+            hr_dir = os.path.join(self.hr_root, f"{region}-VV")
+            angle_dir = os.path.join(self.angle_root, f"{region}-Ang")
+            ewc_path = os.path.join(self.ewc_root, f"EWC556{region}.tif")
+            dem_path = os.path.join(self.dem_root, f"DEM556{region}.tif")
+
+            for lr_file in sorted(os.listdir(lr_dir)):
+                timestamp = self.extract_timestamp(lr_file)
+                if timestamp is None:
+                    continue
+
+                hr_file = self.find_matching_file(hr_dir, timestamp)
+                angle_file = self.find_matching_file(angle_dir, timestamp)
+
+                if hr_file and angle_file:
+                    sample = (
+                        os.path.join(lr_dir, lr_file),
+                        os.path.join(hr_dir, hr_file),
+                        os.path.join(angle_dir, angle_file),
+                        ewc_path,
+                        dem_path,
+                    )
+                    self.samples.append(sample)
+
+    def find_matching_file(self, folder, timestamp):
+        """Find the first file in the folder containing the given timestamp."""
+        for fname in os.listdir(folder):
+            if timestamp in fname:
+                return fname
+        return None
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        lr_path, hr_path, angle_path, lc_path, dem_path = self.samples[idx]
+
+        im_lr = rasterio.open(lr_path).read().squeeze()
+        im_hr = rasterio.open(hr_path).read().squeeze()
+        im_angle = rasterio.open(angle_path).read().squeeze()
+        im_lc = rasterio.open(lc_path).read().squeeze()
+        im_dem = rasterio.open(dem_path).read().squeeze()
+
+        # Crop and resize to uniform size
+        im_lr, im_hr, im_angle, im_lc, im_dem = [
+            cv2.resize(im[3:256, 2:253], (256, 256), interpolation=cv2.INTER_NEAREST)
+            for im in [im_lr, im_hr, im_angle, im_lc, im_dem]
+        ]
+
+        return im_lr[None], im_hr[None], im_angle[None], im_lc[None], im_dem[None]
+
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    import os
+    import numpy as np
+
+    dataset = LRHRDataSet()
+    os.makedirs("sanity_plots", exist_ok=True)
+
+    for i in range(min(10, len(dataset))):  # Check the first 10 samples
+        im_lr, im_hr, im_angle, im_lc, im_dem = dataset[i]
+
+        images = {
+            "LR": im_lr.squeeze(),
+            "HR": im_hr.squeeze(),
+            "Angle": im_angle.squeeze(),
+            "Land Cover": im_lc.squeeze(),
+            "DEM": im_dem.squeeze(),
+        }
+
+        print(f"\nSample {i}:")
+        for name, img in images.items():
+            min_val = np.nanmin(img)
+            max_val = np.nanmax(img)
+            nan_count = np.isnan(img).sum()
+            print(
+                f"  {name:<12} | Min: {min_val:.3f} | Max: {max_val:.3f} | NaNs: {nan_count}"
+            )
+
+        # Optional: replace NaNs with 0 for visualization if needed
+        for key in images:
+            if np.isnan(images[key]).any():
+                images[key] = np.nan_to_num(images[key])
+
+        # Plot
+        plt.figure(figsize=(15, 3))
+        for j, (name, img) in enumerate(images.items()):
+            plt.subplot(1, 5, j + 1)
+            if name in ["LR", "HR"]:
+                cmap = "gray"
+            elif name == "Angle":
+                cmap = "viridis"  # or 'plasma', 'cividis', etc.
+            elif name == "Land Cover":
+                cmap = "tab20"
+            else:  # DEM
+                cmap = "terrain"
+            plt.imshow(img, cmap=cmap)
+            plt.title(name)
+            plt.axis("off")
+
+        plt.tight_layout()
+        plt.savefig(f"sanity_plots/sample_{i}.png")
+        plt.close()
