@@ -27,7 +27,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ------------------------- DATA ----------------------------- #
 print("[INFO] Loading dataset …")
-dataset = LRHRDataSet(mode="train", indices=np.arange(30))
+dataset = LRHRDataSet(mode="train", indices=np.arange(300, 320))
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # ----------------- MODEL + SCHEDULER ------------------------ #
@@ -45,7 +45,7 @@ print("[INFO] Building model …")
 
 model = UNet2DConditionModel(
     sample_size=IMG_SIZE,
-    in_channels=1,
+    in_channels=2,  # HR noise + LR as channels
     out_channels=1,
     layers_per_block=2,
     block_out_channels=(64, 128, 256, 256),
@@ -91,6 +91,10 @@ def lr_to_embedding(lr_up: torch.Tensor):
     return lr_up.view(b, c, h * w).permute(0, 2, 1).to(DEVICE)
 
 
+def denormalize(img, mean, std):
+    return img * std + mean
+
+  
 # Automatic mixed precision only on CUDA
 autocast_ctx = (
     torch.autocast(device_type="cuda") if DEVICE.type == "cuda" else nullcontext()
@@ -101,27 +105,26 @@ scheduler.set_timesteps(STEPS, device=DEVICE)
 # -------------------- INFERENCE ----------------------------- #
 print("[INFO] Starting inference with DDIM …")
 with torch.no_grad():
+    # Get means and stds from dataset for denormalization
+    means = dataset._means
+    stds = dataset._stds
+
     for batch_idx, batch in enumerate(dataloader):
-        # ---------------------------------------------------- #
-        im_lr, im_hr, im_cond1, im_cond2 = [t.to("cuda").float() for t in batch[:4]]
+        im_lr, im_hr, _, _, _ = [t.to(DEVICE).float() for t in batch]
 
-        # im_lr = im_lr.to(DEVICE, dtype=torch.float32)
-        # im_hr = im_hr.to(DEVICE, dtype=torch.float32)
-
-        # network_input =  torch.cat([im_lr_norm, im_cond1, im_cond2_normed], dim=1)
         # Start from pure Gaussian noise having HR shape
         x = torch.randn_like(im_hr).to(DEVICE)
-        # x = im_cond1
 
         # Conditioning from LR
         cond_emb = lr_to_embedding(im_lr)
 
-        # Iterate over scheduler‑generated timesteps
+        # DDIM sampling loop, concatenate LR as extra channel at each step
         for t in scheduler.timesteps:
             t_batch = torch.full((x.shape[0],), t, device=DEVICE, dtype=torch.long)
+            x_cond = torch.cat([x, im_lr], dim=1)  # [B, 2, H, W]
             with autocast_ctx:
-                pred_noise = model(x, t_batch, encoder_hidden_states=cond_emb)["sample"]
-            # DDIM update (eta controls stochasticity)
+                pred_noise = model(x_cond, t_batch, encoder_hidden_states=cond_emb)["sample"]
+                
             x = scheduler.step(
                 model_output=pred_noise,
                 timestep=t_batch,
@@ -131,22 +134,26 @@ with torch.no_grad():
 
         # Clamp, move to CPU for plotting
         sr = x.cpu().squeeze(1)
-
         im_lr_cpu = im_lr.cpu().squeeze(1)
         im_hr_cpu = im_hr.cpu().squeeze(1)
+
+        # --------- DENORMALIZE for visualization --------------
+        # Channel 0: LR, Channel 1: HR
+        sr_denorm = denormalize(sr, means[1], stds[1])
+        im_lr_denorm = denormalize(im_lr_cpu, means[0], stds[0])
+        im_hr_denorm = denormalize(im_hr_cpu, means[1], stds[1])
 
         # ------------- VISUALIZATION & SAVING --------------- #
         for i in range(sr.size(0)):
             fig, axs = plt.subplots(1, 3, figsize=(12, 4))
-            axs[0].imshow(im_lr_cpu[i], cmap="viridis")
-            axs[0].set_title("Low‑Res (Input)")
+            axs[0].imshow(im_lr_denorm[i], cmap="viridis")
+            axs[0].set_title("Low-Res (Input)")
 
-            axs[1].imshow(
-                im_hr_cpu[i], cmap="viridis"
-            )  # Or denormalize this too if needed
-            axs[1].set_title("High‑Res (GT)")
+            axs[1].imshow(im_hr_denorm[i], cmap="viridis")
+            axs[1].set_title("High-Res (GT)")
 
-            axs[2].imshow(sr[i], cmap="viridis")
+            axs[2].imshow(sr_denorm[i], cmap="viridis")
+
             axs[2].set_title("Reconstructed HR (DDIM)")
 
             for ax in axs:

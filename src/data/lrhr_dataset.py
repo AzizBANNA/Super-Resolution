@@ -7,13 +7,14 @@ from torch.utils.data import Dataset
 
 
 class LRHRDataSet(Dataset):
-    def __init__(self, data_root="sr_data", mode="train", indices=None):
+    def __init__(self, data_root="sr_data", mode="train", indices=None, zscore=True):
         self.mode = mode
         self.lr_root = os.path.join(data_root, "LR")
         self.hr_root = os.path.join(data_root, "HR", "VV")
         self.angle_root = os.path.join(data_root, "IncAngle")
         self.ewc_root = os.path.join(data_root, "EWC")
         self.dem_root = os.path.join(data_root, "DEM")
+        self.zscore = zscore
 
         self.samples = []  # list of (lr_path, hr_path, angle_path, lc_path, dem_path)
         self.build_samples()
@@ -22,6 +23,11 @@ class LRHRDataSet(Dataset):
         else:
             self.samples = np.array(self.samples)[indices]
 
+        # Compute mean and std for each channel if zscore normalization is enabled
+        if self.zscore:
+            self._compute_zscore_stats()
+
+        
     def extract_timestamp(self, filename):
         """Extract date string from filename (format: 20170522 or similar)."""
         match = re.search(r"(20\d{6})", filename)
@@ -33,7 +39,7 @@ class LRHRDataSet(Dataset):
             if not os.path.isdir(os.path.join(self.lr_root, region_folder)):
                 continue
             region = region_folder.replace("-SMAP", "")
-            # lr_dir = os.path.join(self.ewc_root, region_folder)
+
             lr_dir = os.path.join(self.lr_root, region_folder)
             hr_dir = os.path.join(self.hr_root, f"{region}-VV")
             angle_dir = os.path.join(self.angle_root, f"{region}-Ang")
@@ -65,23 +71,57 @@ class LRHRDataSet(Dataset):
                 return fname
         return None
 
+    def _compute_zscore_stats(self):
+        # Compute mean and std for each modality over the dataset, ignoring NaNs
+        means = [[] for _ in range(5)]
+        stds = [[] for _ in range(5)]
+        for idx in range(len(self.samples)):
+            paths = self.samples[idx]
+            ims = []
+            for p in paths:
+                arr = rasterio.open(p).read().squeeze().astype(np.float32)
+                arr = arr[np.isfinite(arr)]
+                ims.append(arr)
+            for i, arr in enumerate(ims):
+                if arr.size > 0:
+                    means[i].append(arr.mean())
+                    stds[i].append(arr.std())
+        # Store global mean and std for each modality
+        self._means = [float(np.mean(m)) if len(m) > 0 else 0.0 for m in means]
+        self._stds = [float(np.mean(s)) if len(s) > 0 else 1.0 for s in stds]
+
+    def zscore_normalize(self, img, idx):
+        img = np.nan_to_num(img)  # Replace NaNs with zero before normalization
+        mean = self._means[idx]
+        std = self._stds[idx]
+        if std == 0:
+            return img - mean
+        return (img - mean) / std
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         lr_path, hr_path, angle_path, lc_path, dem_path = self.samples[idx]
 
-        im_lr = rasterio.open(lr_path).read().squeeze()
-        im_hr = rasterio.open(hr_path).read().squeeze()
-        im_angle = rasterio.open(angle_path).read().squeeze()
-        im_lc = rasterio.open(lc_path).read().squeeze()
-        im_dem = rasterio.open(dem_path).read().squeeze()
+        im_lr = rasterio.open(lr_path).read().squeeze().astype(np.float32)
+        im_hr = rasterio.open(hr_path).read().squeeze().astype(np.float32)
+        im_angle = rasterio.open(angle_path).read().squeeze().astype(np.float32)
+        im_lc = rasterio.open(lc_path).read().squeeze().astype(np.float32)
+        im_dem = rasterio.open(dem_path).read().squeeze().astype(np.float32)
 
         # Crop and resize to uniform size
         im_lr, im_hr, im_angle, im_lc, im_dem = [
             cv2.resize(im[3:256, 2:253], (256, 256), interpolation=cv2.INTER_NEAREST)
             for im in [im_lr, im_hr, im_angle, im_lc, im_dem]
         ]
+
+        if self.zscore:
+            im_lr = self.zscore_normalize(im_lr, 0)
+            im_hr = self.zscore_normalize(im_hr, 1)
+            im_angle = self.zscore_normalize(im_angle, 2)
+            im_lc = self.zscore_normalize(im_lc, 3)
+            im_dem = self.zscore_normalize(im_dem, 4)
 
         return im_lr[None], im_hr[None], im_angle[None], im_lc[None], im_dem[None]
 

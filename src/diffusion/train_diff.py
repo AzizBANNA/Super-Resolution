@@ -21,7 +21,7 @@ NUM_EPOCHS = 500
 SAVE_FREQ = 50
 BATCH_SIZE = 2
 LR = 1e-4
-LOG_PATH = "diff_logs"
+LOG_PATH = "results/diffusion_train_logs"
 CKPT_DIR = "results/diffusion_baseline_checkpoints"
 IMG_SIZE_HR = 256
 USE_MIXED_PREC = True
@@ -57,8 +57,8 @@ class DiffusionSRTrainer:
 
         # train_ds = LRHRDataSet(mode="train", indices=np.arange(0, 120))
         # val_ds = LRHRDataSet(mode="train", indices=np.arange(120, 142))
-        train_ds = LRHRDataSet(mode="train", indices=np.arange(0, 30))
-        val_ds = LRHRDataSet(mode="train", indices=np.arange(30, 35))
+        train_ds = LRHRDataSet(mode="train", indices=np.arange(0, 300))
+        val_ds = LRHRDataSet(mode="train", indices=np.arange(300, 320))
         self.train_loader = DataLoader(
             train_ds,
             batch_size=BATCH_SIZE,
@@ -70,9 +70,10 @@ class DiffusionSRTrainer:
             val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True
         )
 
+        # Change: in_channels=2 to accept HR+LR as input channels
         self.model = UNet2DConditionModel(
             sample_size=IMG_SIZE_HR,
-            in_channels=1,
+            in_channels=2,  # HR + LR as channels
             out_channels=1,
             layers_per_block=2,
             block_out_channels=(64, 128, 256, 256),
@@ -110,11 +111,13 @@ class DiffusionSRTrainer:
         noise = torch.randn_like(im_hr)
         x_t = self.scheduler.add_noise(im_hr, noise, t)
 
-        cond_img = im_lr
-        cond_emb = lr_to_embedding(cond_img)
+        # Concatenate LR as an extra channel to the noisy HR
+        x_t_cond = torch.cat([x_t, im_lr], dim=1)  # [B, 2, H, W]
+
+        cond_emb = lr_to_embedding(im_lr)
 
         with self.acc.autocast():
-            pred_noise = self.model(x_t, t, encoder_hidden_states=cond_emb)["sample"]
+            pred_noise = self.model(x_t_cond, t, encoder_hidden_states=cond_emb)["sample"]
             loss = F.mse_loss(pred_noise, noise)
 
         self.acc.backward(loss)
@@ -159,16 +162,17 @@ class DiffusionSRTrainer:
         im_lr, im_hr, _, _, _ = [t.to(self.device) for t in batch]
         sanity_check(im_lr, im_hr)
 
-        # cond_img = upsample_to_hr(im_lr, (IMG_SIZE_HR, IMG_SIZE_HR))
         cond_emb = lr_to_embedding(im_lr)
 
         latents = torch.randn(
             (im_lr.size(0), 1, IMG_SIZE_HR, IMG_SIZE_HR), device=self.device
         )
 
+        # Concatenate LR as extra channel for each step
         for t in tqdm(sampler.timesteps):
+            latents_cond = torch.cat([latents, im_lr], dim=1)  # [B, 2, H, W]
             noise_pred = self.model(
-                sample=latents, timestep=t, encoder_hidden_states=cond_emb
+                sample=latents_cond, timestep=t, encoder_hidden_states=cond_emb
             )["sample"]
             latents = sampler.step(noise_pred, t, latents).prev_sample
 
