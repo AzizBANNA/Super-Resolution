@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from tensorboardX import SummaryWriter
 from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler
 from accelerate import Accelerator
@@ -15,6 +15,9 @@ from skimage.metrics import peak_signal_noise_ratio as compute_psnr
 from src.data.lrhr_dataset import LRHRDataSet
 from torchvision.utils import save_image
 import os
+import datetime
+
+np.random.seed(42)  # For reproducibility
 
 # ------------------------- hyperparameters ------------------------- #
 NUM_EPOCHS = 500
@@ -25,6 +28,8 @@ LOG_PATH = "results/diffusion_train_logs"
 CKPT_DIR = "results/diffusion_baseline_checkpoints"
 IMG_SIZE_HR = 256
 USE_MIXED_PREC = True
+
+NUM_CLASSES = 11  # <-- Set this to your number of classes
 
 
 # ------------------------- helpers ------------------------- #
@@ -49,16 +54,44 @@ def sanity_check(im_lr, im_hr):
         raise ValueError("Input contains NaN values")
 
 
+def onehot_spatial(cond_lc, num_classes, device):
+    """
+    Converts a [B, 1, H, W] tensor of class indices to a [B, num_classes, H, W] one-hot tensor.
+    """
+    cond_lc = (cond_lc / 10).to(torch.int64)
+    cond_lc_onehot = F.one_hot(
+        cond_lc.squeeze(1), num_classes=num_classes
+    )  # [B, H, W, C]
+    cond_lc_onehot = (
+        cond_lc_onehot.permute(0, 3, 1, 2).float().to(device)
+    )  # [B, C, H, W]
+    return cond_lc_onehot
+
+
 # ------------------------- trainer ------------------------- #
 class DiffusionSRTrainer:
-    def __init__(self):
+    def __init__(self, resume_ckpt=None):
         self.acc = build_accelerator()
         self.device = self.acc.device
 
-        # train_ds = LRHRDataSet(mode="train", indices=np.arange(0, 120))
-        # val_ds = LRHRDataSet(mode="train", indices=np.arange(120, 142))
-        train_ds = LRHRDataSet(mode="train", indices=np.arange(0, 300))
-        val_ds = LRHRDataSet(mode="train", indices=np.arange(300, 320))
+        # ========== results directory with timestamp ==========
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.results_dir = os.path.join("results", timestamp)
+        self.ckpt_dir = os.path.join(self.results_dir, "checkpoints")
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        self.outputs_dir = os.path.join(self.results_dir, "outputs_baseline")
+        os.makedirs(self.outputs_dir, exist_ok=True)
+        self.log_path = os.path.join(self.results_dir, "diffusion_train_logs")
+
+        # Get total dataset and split into train/val using random_split with a fixed seed
+        full_dataset = LRHRDataSet(mode="train")
+        total_size = len(full_dataset)
+        print(f"Total dataset size: {total_size}")
+        split = int(0.9 * total_size)
+        lengths = [split, total_size - split]
+        generator = torch.Generator().manual_seed(42)
+        train_ds, val_ds = random_split(full_dataset, lengths, generator=generator)
+
         self.train_loader = DataLoader(
             train_ds,
             batch_size=BATCH_SIZE,
@@ -70,10 +103,10 @@ class DiffusionSRTrainer:
             val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True
         )
 
-        # Change: in_channels=2 to accept HR+LR as input channels
+        # Update in_channels: 1 (noisy LR) + 1 (LR) + NUM_CLASSES (one-hot)
         self.model = UNet2DConditionModel(
             sample_size=IMG_SIZE_HR,
-            in_channels=2,  # HR + LR as channels
+            in_channels=4 + NUM_CLASSES,  # noisy LR + LR + one-hot + DEM + IncAngle
             out_channels=1,
             layers_per_block=2,
             block_out_channels=(64, 128, 256, 256),
@@ -90,34 +123,57 @@ class DiffusionSRTrainer:
 
         self.scheduler = DDPMScheduler(num_train_timesteps=1000)
         self.opt = optim.AdamW(self.model.parameters(), lr=LR)
-        self.writer = SummaryWriter(LOG_PATH)
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.opt, T_max=NUM_EPOCHS
+        )
+        self.writer = SummaryWriter(self.log_path)
         self.step = self.epoch = 0
+        self.best_val_loss = float("inf")
 
         self.model, self.opt, self.train_loader, self.val_loader = self.acc.prepare(
             self.model, self.opt, self.train_loader, self.val_loader
         )
 
+        # --------- Hot start logic ---------
+        if resume_ckpt is not None and os.path.isfile(resume_ckpt):
+            print(f"[INFO] Loading checkpoint from {resume_ckpt}")
+            checkpoint = torch.load(resume_ckpt, map_location=self.device)
+            self.model.load_state_dict(checkpoint["model"])
+            self.opt.load_state_dict(checkpoint["opt"])
+            self.epoch = checkpoint.get("epoch", 0)
+            self.step = checkpoint.get("step", 0)
+            print(f"[INFO] Resumed from epoch {self.epoch}, step {self.step}")
+
     def train_step(self, batch):
-        im_lr, im_hr, _, _, _ = batch
+        im_lr, im_hr, cond_angle, cond_lc, cond_dem = batch
         im_lr = im_lr.to(self.device).float()
         im_hr = im_hr.to(self.device).float()
+        cond_lc = cond_lc.to(self.device)
+        cond_dem = cond_dem.to(self.device)
 
         sanity_check(im_lr, im_hr)
 
-        b = im_hr.size(0)
+        b = im_hr.shape[0]
         t = torch.randint(
             0, self.scheduler.config.num_train_timesteps, (b,), device=self.device
         ).long()
         noise = torch.randn_like(im_hr)
         x_t = self.scheduler.add_noise(im_hr, noise, t)
 
-        # Concatenate LR as an extra channel to the noisy HR
-        x_t_cond = torch.cat([x_t, im_lr], dim=1)  # [B, 2, H, W]
+        # Use the helper function
+        cond_lc_onehot = onehot_spatial(cond_lc, NUM_CLASSES, self.device)
+        cond_dem_normed = (cond_dem - 200) / 100
+
+        x_t_cond = torch.cat(
+            [x_t, im_lr, cond_angle, cond_lc_onehot, cond_dem_normed], dim=1
+        )  # [B, 2+1+NUM_CLASSES+1, H, W]
 
         cond_emb = lr_to_embedding(im_lr)
 
         with self.acc.autocast():
-            pred_noise = self.model(x_t_cond, t, encoder_hidden_states=cond_emb)["sample"]
+            pred_noise = self.model(x_t_cond, t, encoder_hidden_states=cond_emb)[
+                "sample"
+            ]
             loss = F.mse_loss(pred_noise, noise)
 
         self.acc.backward(loss)
@@ -135,12 +191,23 @@ class DiffusionSRTrainer:
                 if self.step % 50 == 0:
                     self.writer.add_scalar("train/loss", loss.item(), self.step)
                 self.step += 1
+            # Validation after each epoch
+            val_loss = self.validate()
+            # Print val loss after epoch
+            tqdm.write(f"Epoch {self.epoch} | Validation Loss: {val_loss:.4f}")
+            # Save best checkpoint
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.save_ckpt(best=True)
+            # Save every SAVE_FREQ epochs
             if (self.epoch + 1) % SAVE_FREQ == 0:
                 self.save_ckpt()
+            self.lr_scheduler.step()
         self.sample_ddim(split="val")
 
-    def save_ckpt(self):
-        Path(CKPT_DIR).mkdir(exist_ok=True)
+    def save_ckpt(self, best=False):
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        fpath = os.path.join(self.ckpt_dir, f"diff_sr_ep{self.epoch}.pt")
         torch.save(
             {
                 "model": self.acc.get_state_dict(self.model),
@@ -148,8 +215,54 @@ class DiffusionSRTrainer:
                 "epoch": self.epoch,
                 "step": self.step,
             },
-            Path(CKPT_DIR) / f"diff_sr_ep{self.epoch}.pt",
+            fpath,
         )
+        if best:
+            best_path = os.path.join(self.ckpt_dir, "best.pt")
+            torch.save(
+                {
+                    "model": self.acc.get_state_dict(self.model),
+                    "opt": self.opt.state_dict(),
+                    "epoch": self.epoch,
+                    "step": self.step,
+                },
+                best_path,
+            )
+
+    @torch.no_grad()
+    def validate(self):
+        self.model.eval()
+        total_loss = 0.0
+        count = 0
+        for batch in self.val_loader:
+            im_lr, im_hr, cond_angle, cond_lc, cond_dem = [
+                t.to(self.device) for t in batch
+            ]
+            sanity_check(im_lr, im_hr)
+            cond_lc_onehot = onehot_spatial(cond_lc, NUM_CLASSES, self.device)
+            cond_dem_normed = (cond_dem - 200) / 100
+
+            b = im_hr.shape[0]
+            t = torch.randint(
+                0, self.scheduler.config.num_train_timesteps, (b,), device=self.device
+            ).long()
+            noise = torch.randn_like(im_hr)
+            x_t = self.scheduler.add_noise(im_hr, noise, t)
+
+            x_t_cond = torch.cat(
+                [x_t, im_lr, cond_angle, cond_lc_onehot, cond_dem_normed], dim=1
+            )
+            cond_emb = lr_to_embedding(im_lr)
+            pred = self.model(
+                x_t_cond,
+                t,
+                encoder_hidden_states=cond_emb,
+            )["sample"]
+            loss = F.mse_loss(pred, noise, reduction="mean")
+            total_loss += loss.item() * im_hr.size(0)
+            count += im_hr.size(0)
+        self.model.train()
+        return total_loss / count if count > 0 else 0.0
 
     @torch.no_grad()
     def sample_ddim(self, split="val"):
@@ -159,27 +272,29 @@ class DiffusionSRTrainer:
 
         loader = self.val_loader if split == "val" else self.train_loader
         batch = next(iter(loader))
-        im_lr, im_hr, _, _, _ = [t.to(self.device) for t in batch]
+        im_lr, im_hr, cond_angle, cond_lc, cond_dem = [t.to(self.device) for t in batch]
         sanity_check(im_lr, im_hr)
 
+        cond_lc_onehot = onehot_spatial(cond_lc, NUM_CLASSES, self.device)
         cond_emb = lr_to_embedding(im_lr)
+        cond_dem_normed = (cond_dem - 200) / 100
 
         latents = torch.randn(
             (im_lr.size(0), 1, IMG_SIZE_HR, IMG_SIZE_HR), device=self.device
         )
 
-        # Concatenate LR as extra channel for each step
         for t in tqdm(sampler.timesteps):
-            latents_cond = torch.cat([latents, im_lr], dim=1)  # [B, 2, H, W]
+            latents_cond = torch.cat(
+                [latents, im_lr, cond_angle, cond_lc_onehot, cond_dem_normed], dim=1
+            )  # [B, 2+NUM_CLASSES+1, H, W]
             noise_pred = self.model(
                 sample=latents_cond, timestep=t, encoder_hidden_states=cond_emb
             )["sample"]
             latents = sampler.step(noise_pred, t, latents).prev_sample
 
-        os.makedirs("outputs_baseline", exist_ok=True)
         save_image(
             latents,
-            f"outputs_baseline/ddim_generated_{split}.png",
+            os.path.join(self.outputs_dir, f"ddim_generated_{split}.png"),
             normalize=True,
             value_range=(0, 1),
         )
@@ -205,7 +320,7 @@ class DiffusionSRTrainer:
             axs[2].axis("off")
 
             plt.tight_layout()
-            plt.savefig(f"outputs_baseline/plot_{split}_{i}.png")
+            plt.savefig(os.path.join(self.outputs_dir, f"plot_{split}_{i}.png"))
             plt.close()
 
         avg_psnr = total_psnr / min(im_lr.size(0), 4)
@@ -213,5 +328,16 @@ class DiffusionSRTrainer:
 
 
 if __name__ == "__main__":
-    trainer = DiffusionSRTrainer()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--resume_ckpt",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from",
+    )
+    args = parser.parse_args()
+
+    trainer = DiffusionSRTrainer(resume_ckpt=args.resume_ckpt)
     trainer.run()

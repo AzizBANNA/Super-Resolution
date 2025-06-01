@@ -5,7 +5,7 @@
 import os
 import torch
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 import numpy as np
 from contextlib import nullcontext
 
@@ -13,22 +13,31 @@ from diffusers import UNet2DConditionModel, DDIMScheduler, DDPMScheduler  # ← 
 from src.data.lrhr_dataset import LRHRDataSet  # make sure this module is import‑able
 
 # -------------------------- CONFIG -------------------------- #
-CKPT_PATH = "results/diffusion_baseline_checkpoints/diff_sr_ep499.pt"  # path to .pt checkpoint
+CKPT_PATH = "results/20250530_201803/checkpoints/best.pt"  # path to .pt checkpoint
 BATCH_SIZE = 1  # dataloader batch size
 NUM_SAMPLES = 30  # number of LR‒HR pairs to run
 STEPS = 50  # DDIM inference steps
 IMG_SIZE = 256  # UNet sample size
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAVE_DIR = "results/diffusion_baseline_samples"  # directory for .png outputs
+SAVE_DIR = "results/20250530_201803/validation_samples"  # directory for .png outputs
 ETA = 0.0  # DDIM eta; 0 ⇒ deterministic, >0 ⇒ stochastic
+NUM_CLASSES = 11  # <-- Set this to match your training
 # ------------------------------------------------------------ #
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ------------------------- DATA ----------------------------- #
 print("[INFO] Loading dataset …")
-dataset = LRHRDataSet(mode="train", indices=np.arange(300, 320))
+
+# Get total dataset and split into train/val using random_split with a fixed seed
+full_dataset = LRHRDataSet(mode="train")
+total_size = len(full_dataset)
+split = int(0.9 * total_size)
+lengths = [split, total_size - split]
+generator = torch.Generator().manual_seed(42)
+_, dataset = random_split(full_dataset, lengths, generator=generator)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+print(f"Validation dataset size: {len(dataset)} samples")
 
 # ----------------- MODEL + SCHEDULER ------------------------ #
 print("[INFO] Building model …")
@@ -45,7 +54,7 @@ print("[INFO] Building model …")
 
 model = UNet2DConditionModel(
     sample_size=IMG_SIZE,
-    in_channels=2,  # HR noise + LR as channels
+    in_channels=4 + NUM_CLASSES,  # HR noise + LR + one-hot + dem + ewc
     out_channels=1,
     layers_per_block=2,
     block_out_channels=(64, 128, 256, 256),
@@ -94,7 +103,19 @@ def lr_to_embedding(lr_up: torch.Tensor):
 def denormalize(img, mean, std):
     return img * std + mean
 
-  
+
+def onehot_spatial(cond_lc, num_classes, device):
+    # cond_lc: [B, 1, H, W] -> [B, NUM_CLASSES, H, W]
+    cond_lc = (cond_lc / 10).to(torch.int64)
+    cond_lc_onehot = torch.nn.functional.one_hot(
+        cond_lc.squeeze(1), num_classes=num_classes
+    )  # [B, H, W, C]
+    cond_lc_onehot = (
+        cond_lc_onehot.permute(0, 3, 1, 2).float().to(device)
+    )  # [B, C, H, W]
+    return cond_lc_onehot
+
+
 # Automatic mixed precision only on CUDA
 autocast_ctx = (
     torch.autocast(device_type="cuda") if DEVICE.type == "cuda" else nullcontext()
@@ -106,11 +127,19 @@ scheduler.set_timesteps(STEPS, device=DEVICE)
 print("[INFO] Starting inference with DDIM …")
 with torch.no_grad():
     # Get means and stds from dataset for denormalization
-    means = dataset._means
-    stds = dataset._stds
+    means = dataset.dataset._means
+    stds = dataset.dataset._stds
 
     for batch_idx, batch in enumerate(dataloader):
-        im_lr, im_hr, _, _, _ = [t.to(DEVICE).float() for t in batch]
+        im_lr, im_hr, cond_angle, cond_lc, cond_dem = [
+            t.to(DEVICE).float() for t in batch
+        ]
+
+        # One-hot encode cond_lc
+        cond_lc_onehot = onehot_spatial(
+            cond_lc, NUM_CLASSES, DEVICE
+        )  # [B, NUM_CLASSES, H, W]
+        cond_dem_normed = (cond_dem - 200) / 100
 
         # Start from pure Gaussian noise having HR shape
         x = torch.randn_like(im_hr).to(DEVICE)
@@ -118,13 +147,17 @@ with torch.no_grad():
         # Conditioning from LR
         cond_emb = lr_to_embedding(im_lr)
 
-        # DDIM sampling loop, concatenate LR as extra channel at each step
+        # DDIM sampling loop, concatenate LR and one-hot at each step
         for t in scheduler.timesteps:
             t_batch = torch.full((x.shape[0],), t, device=DEVICE, dtype=torch.long)
-            x_cond = torch.cat([x, im_lr], dim=1)  # [B, 2, H, W]
+            x_cond = torch.cat(
+                [x, im_lr, cond_angle, cond_lc_onehot, cond_dem_normed], dim=1
+            )  # [B, 2+NUM_CLASSES, H, W]
             with autocast_ctx:
-                pred_noise = model(x_cond, t_batch, encoder_hidden_states=cond_emb)["sample"]
-                
+                pred_noise = model(x_cond, t_batch, encoder_hidden_states=cond_emb)[
+                    "sample"
+                ]
+
             x = scheduler.step(
                 model_output=pred_noise,
                 timestep=t_batch,
