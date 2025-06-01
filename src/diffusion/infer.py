@@ -8,18 +8,20 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, random_split
 import numpy as np
 from contextlib import nullcontext
+from skimage.metrics import peak_signal_noise_ratio as compute_psnr
+from skimage.metrics import structural_similarity as compute_ssim
 
 from diffusers import UNet2DConditionModel, DDIMScheduler, DDPMScheduler  # ← DDIM!
 from src.data.lrhr_dataset import LRHRDataSet  # make sure this module is import‑able
 
 # -------------------------- CONFIG -------------------------- #
-CKPT_PATH = "results/20250530_201803/checkpoints/best.pt"  # path to .pt checkpoint
+CKPT_PATH = "results/20250601_145126/checkpoints/best.pt"  # path to .pt checkpoint
 BATCH_SIZE = 1  # dataloader batch size
 NUM_SAMPLES = 30  # number of LR‒HR pairs to run
 STEPS = 50  # DDIM inference steps
 IMG_SIZE = 256  # UNet sample size
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAVE_DIR = "results/20250530_201803/validation_samples"  # directory for .png outputs
+SAVE_DIR = "results/20250601_145126/validation_samples"  # directory for .png outputs
 ETA = 0.0  # DDIM eta; 0 ⇒ deterministic, >0 ⇒ stochastic
 NUM_CLASSES = 11  # <-- Set this to match your training
 # ------------------------------------------------------------ #
@@ -38,6 +40,18 @@ generator = torch.Generator().manual_seed(42)
 _, dataset = random_split(full_dataset, lengths, generator=generator)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 print(f"Validation dataset size: {len(dataset)} samples")
+
+# Compute min and max over the whole validation dataset (HR channel)
+hr_min, hr_max = float("inf"), float("-inf")
+for batch in dataloader:
+    _, im_hr, _, _, _ = [t for t in batch]
+    batch_min = im_hr.min().item()
+    batch_max = im_hr.max().item()
+    if batch_min < hr_min:
+        hr_min = batch_min
+    if batch_max > hr_max:
+        hr_max = batch_max
+print(f"[INFO] HR data range over validation set: min={hr_min}, max={hr_max}")
 
 # ----------------- MODEL + SCHEDULER ------------------------ #
 print("[INFO] Building model …")
@@ -130,6 +144,11 @@ with torch.no_grad():
     means = dataset.dataset._means
     stds = dataset.dataset._stds
 
+    psnr_list = []
+    ssim_list = []
+    scc_list = []
+    mse_list = []
+
     for batch_idx, batch in enumerate(dataloader):
         im_lr, im_hr, cond_angle, cond_lc, cond_dem = [
             t.to(DEVICE).float() for t in batch
@@ -186,17 +205,57 @@ with torch.no_grad():
             axs[1].set_title("High-Res (GT)")
 
             axs[2].imshow(sr_denorm[i], cmap="viridis")
-
             axs[2].set_title("Reconstructed HR (DDIM)")
+
+            # ---- Convert to numpy for metrics ----
+            hr_np = (
+                im_hr_denorm[i].cpu().numpy()
+                if torch.is_tensor(im_hr_denorm[i])
+                else im_hr_denorm[i]
+            )
+            sr_np = (
+                sr_denorm[i].cpu().numpy()
+                if torch.is_tensor(sr_denorm[i])
+                else sr_denorm[i]
+            )
+
+            # ---- Compute metrics ----
+            psnr = compute_psnr(hr_np, sr_np, data_range=hr_max - hr_min)
+            ssim = compute_ssim(hr_np, sr_np, data_range=hr_max - hr_min)
+            scc = np.corrcoef(sr_np.flatten(), hr_np.flatten())[0, 1]
+            mse = np.mean((sr_np - hr_np) ** 2)
+
+            psnr_list.append(psnr)
+            ssim_list.append(ssim)
+            scc_list.append(scc)
+            mse_list.append(mse)
+
+            # Centralized subtitle with tab-separated metrics
+            fig.suptitle(
+                f"PSNR: {psnr:.2f} dB   |   SSIM: {ssim:.3f}   |    SCC: {scc:.3f}   |   MSE: {mse:.4f}",
+                fontsize=12,
+                y=0.98,
+            )
 
             for ax in axs:
                 ax.axis("off")
-            plt.tight_layout()
+
+            # Make layout more tight and images closer
+            plt.subplots_adjust(
+                wspace=0.01, hspace=0.01, left=0.01, right=0.99, top=0.92, bottom=0.01
+            )
+            plt.tight_layout(rect=[0, 0, 1, 0.95], pad=0.2, w_pad=0.01, h_pad=0.05)
 
             fname = f"sample_{batch_idx}_{i}.png"
             fpath = os.path.join(SAVE_DIR, fname)
             fig.savefig(fpath, bbox_inches="tight")
             plt.close(fig)
             print(f"[INFO] Saved → {fpath}")
+
+    # Print average metrics at the end
+    print(f"\n[RESULT] Average PSNR: {np.mean(psnr_list):.2f} dB")
+    print(f"[RESULT] Average SSIM: {np.mean(ssim_list):.4f}")
+    print(f"[RESULT] Average SCC: {np.mean(scc_list):.4f}")
+    print(f"[RESULT] Average MSE: {np.mean(mse_list):.4f}")
 
 print("[DONE] All figures written to", os.path.abspath(SAVE_DIR))
