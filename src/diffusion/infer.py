@@ -15,13 +15,13 @@ from diffusers import UNet2DConditionModel, DDIMScheduler, DDPMScheduler  # ← 
 from src.data.lrhr_dataset import LRHRDataSet  # make sure this module is import‑able
 
 # -------------------------- CONFIG -------------------------- #
-CKPT_PATH = "results/20250601_145126/checkpoints/best.pt"  # path to .pt checkpoint
+CKPT_PATH = "results/20250602_101735/checkpoints/best.pt"  # path to .pt checkpoint
 BATCH_SIZE = 1  # dataloader batch size
 NUM_SAMPLES = 30  # number of LR‒HR pairs to run
 STEPS = 50  # DDIM inference steps
 IMG_SIZE = 256  # UNet sample size
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAVE_DIR = "results/20250601_145126/validation_samples"  # directory for .png outputs
+SAVE_DIR = "results/20250602_101735/validation_samples"  # directory for .png outputs
 ETA = 0.0  # DDIM eta; 0 ⇒ deterministic, >0 ⇒ stochastic
 NUM_CLASSES = 11  # <-- Set this to match your training
 # ------------------------------------------------------------ #
@@ -32,12 +32,22 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 print("[INFO] Loading dataset …")
 
 # Get total dataset and split into train/val using random_split with a fixed seed
+# full_dataset = LRHRDataSet(mode="val")
+# total_size = len(full_dataset)
+# split = int(0.9 * total_size)
+# lengths = [split, total_size - split]
+# generator = torch.Generator().manual_seed(42)
+# _, dataset = random_split(full_dataset, lengths, generator=generator)
+# dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 full_dataset = LRHRDataSet(mode="train")
 total_size = len(full_dataset)
+print(f"[INFO] Total dataset size: {total_size}")
+indices = np.arange(total_size)
+np.random.seed(42)
+np.random.shuffle(indices)
 split = int(0.9 * total_size)
-lengths = [split, total_size - split]
-generator = torch.Generator().manual_seed(42)
-_, dataset = random_split(full_dataset, lengths, generator=generator)
+val_indices = indices[split:]
+dataset = LRHRDataSet(mode="val", indices=val_indices)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 print(f"Validation dataset size: {len(dataset)} samples")
 
@@ -71,7 +81,8 @@ model = UNet2DConditionModel(
     in_channels=4 + NUM_CLASSES,  # HR noise + LR + one-hot + dem + ewc
     out_channels=1,
     layers_per_block=2,
-    block_out_channels=(64, 128, 256, 256),
+    # block_out_channels=(64, 128, 256, 256),
+    block_out_channels=(128, 256, 384, 512),
     down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D"),
     up_block_types=("UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"),
     class_embed_type=None,
@@ -141,8 +152,10 @@ scheduler.set_timesteps(STEPS, device=DEVICE)
 print("[INFO] Starting inference with DDIM …")
 with torch.no_grad():
     # Get means and stds from dataset for denormalization
-    means = dataset.dataset._means
-    stds = dataset.dataset._stds
+    # means = dataset.dataset._means
+    # stds = dataset.dataset._stds
+    means = dataset._means
+    stds = dataset._stds
 
     psnr_list = []
     ssim_list = []
