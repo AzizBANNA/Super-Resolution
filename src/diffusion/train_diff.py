@@ -22,8 +22,8 @@ np.random.seed(42)  # For reproducibility
 # ------------------------- hyperparameters ------------------------- #
 NUM_EPOCHS = 500
 SAVE_FREQ = 50
-BATCH_SIZE = 2
-LR = 1e-4
+BATCH_SIZE = 4
+LR = 5e-5
 LOG_PATH = "results/diffusion_train_logs"
 CKPT_DIR = "results/diffusion_baseline_checkpoints"
 IMG_SIZE_HR = 256
@@ -86,21 +86,29 @@ class DiffusionSRTrainer:
         # Get total dataset and split into train/val using random_split with a fixed seed
         full_dataset = LRHRDataSet(mode="train")
         total_size = len(full_dataset)
-        print(f"Total dataset size: {total_size}")
+        print(f"[INFO] Total dataset size: {total_size}")
+        indices = np.arange(total_size)
+        np.random.seed(42)
+        np.random.shuffle(indices)
         split = int(0.9 * total_size)
-        lengths = [split, total_size - split]
-        generator = torch.Generator().manual_seed(42)
-        train_ds, val_ds = random_split(full_dataset, lengths, generator=generator)
+        train_indices, val_indices = indices[:split], indices[split:]
+
+        train_dataset = LRHRDataSet(mode="train", indices=train_indices)
+        val_dataset = LRHRDataSet(mode="val", indices=val_indices)
 
         self.train_loader = DataLoader(
-            train_ds,
+            train_dataset,
             batch_size=BATCH_SIZE,
             shuffle=True,
-            num_workers=4,
+            num_workers=2,
             pin_memory=True,
         )
         self.val_loader = DataLoader(
-            val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True
+            val_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
         )
 
         # Update in_channels: 1 (noisy LR) + 1 (LR) + NUM_CLASSES (one-hot)
@@ -109,7 +117,8 @@ class DiffusionSRTrainer:
             in_channels=4 + NUM_CLASSES,  # noisy LR + LR + one-hot + DEM + IncAngle
             out_channels=1,
             layers_per_block=2,
-            block_out_channels=(64, 128, 256, 256),
+            # block_out_channels=(64, 128, 256, 256),
+            block_out_channels=(128, 256, 384, 512),
             down_block_types=(
                 "DownBlock2D",
                 "DownBlock2D",
@@ -143,6 +152,10 @@ class DiffusionSRTrainer:
             self.epoch = checkpoint.get("epoch", 0)
             self.step = checkpoint.get("step", 0)
             print(f"[INFO] Resumed from epoch {self.epoch}, step {self.step}")
+
+            # --- Advance LR scheduler to the correct epoch ---
+            for _ in range(self.epoch):
+                self.lr_scheduler.step()
 
     def train_step(self, batch):
         im_lr, im_hr, cond_angle, cond_lc, cond_dem = batch

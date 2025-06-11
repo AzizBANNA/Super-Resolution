@@ -3,11 +3,17 @@ import re
 import rasterio
 import numpy as np
 import cv2
+import random
 from torch.utils.data import Dataset
+
+random.seed(42)
+np.random.seed(42)
 
 
 class LRHRDataSet(Dataset):
-    def __init__(self, data_root="sr_data", mode="train", indices=None, zscore=True):
+    def __init__(
+        self, data_root="sr_data", mode="train", indices=None, zscore=True, augment=True
+    ):
         self.mode = mode
         self.lr_root = os.path.join(data_root, "LR")
         self.hr_root = os.path.join(data_root, "HR", "VV")
@@ -15,6 +21,7 @@ class LRHRDataSet(Dataset):
         self.ewc_root = os.path.join(data_root, "EWC")
         self.dem_root = os.path.join(data_root, "DEM")
         self.zscore = zscore
+        self.augment = augment
 
         self.samples = []  # list of (lr_path, hr_path, angle_path, lc_path, dem_path)
         self.build_samples()
@@ -27,7 +34,6 @@ class LRHRDataSet(Dataset):
         if self.zscore:
             self._compute_zscore_stats()
 
-        
     def extract_timestamp(self, filename):
         """Extract date string from filename (format: 20170522 or similar)."""
         match = re.search(r"(20\d{6})", filename)
@@ -98,23 +104,48 @@ class LRHRDataSet(Dataset):
             return img - mean
         return (img - mean) / std
 
+    def _random_flip_and_rotate(self, ims):
+        # ims: list of np arrays, all shape (H, W)
+        # Random horizontal flip
+        if random.random() > 0.5:
+            ims = [np.fliplr(im) for im in ims]
+        # Random vertical flip
+        if random.random() > 0.5:
+            ims = [np.flipud(im) for im in ims]
+        # Random 90-degree rotation
+        k = random.randint(0, 3)
+        if k > 0:
+            ims = [np.rot90(im, k) for im in ims]
+        return ims
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         lr_path, hr_path, angle_path, lc_path, dem_path = self.samples[idx]
 
-        im_lr = rasterio.open(lr_path).read().squeeze().astype(np.float32)
-        im_hr = rasterio.open(hr_path).read().squeeze().astype(np.float32)
-        im_angle = rasterio.open(angle_path).read().squeeze().astype(np.float32)
-        im_lc = rasterio.open(lc_path).read().squeeze().astype(np.float32)
-        im_dem = rasterio.open(dem_path).read().squeeze().astype(np.float32)
+        with rasterio.open(lr_path) as src:
+            im_lr = src.read().squeeze().astype(np.float32)
+        with rasterio.open(hr_path) as src:
+            im_hr = src.read().squeeze().astype(np.float32)
+        with rasterio.open(angle_path) as src:
+            im_angle = src.read().squeeze().astype(np.float32)
+        with rasterio.open(lc_path) as src:
+            im_lc = src.read().squeeze().astype(np.float32)
+        with rasterio.open(dem_path) as src:
+            im_dem = src.read().squeeze().astype(np.float32)
 
         # Crop and resize to uniform size
         im_lr, im_hr, im_angle, im_lc, im_dem = [
             cv2.resize(im[3:256, 2:253], (256, 256), interpolation=cv2.INTER_NEAREST)
             for im in [im_lr, im_hr, im_angle, im_lc, im_dem]
         ]
+
+        # --- Data augmentation (only in training mode) ---
+        if self.mode == "train" and self.augment:
+            im_lr, im_hr, im_angle, im_lc, im_dem = self._random_flip_and_rotate(
+                [im_lr, im_hr, im_angle, im_lc, im_dem]
+            )
 
         if self.zscore:
             im_lr = self.zscore_normalize(im_lr, 0)
