@@ -15,13 +15,13 @@ from diffusers import UNet2DConditionModel, DDIMScheduler, DDPMScheduler  # ← 
 from src.data.lrhr_dataset import LRHRDataSet  # make sure this module is import‑able
 
 # -------------------------- CONFIG -------------------------- #
-CKPT_PATH = "results/20250602_101735/checkpoints/best.pt"  # path to .pt checkpoint
+CKPT_PATH = "results/20250620_082708/checkpoints/best.pt"  # path to .pt checkpoint
 BATCH_SIZE = 1  # dataloader batch size
 NUM_SAMPLES = 30  # number of LR‒HR pairs to run
 STEPS = 50  # DDIM inference steps
 IMG_SIZE = 256  # UNet sample size
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAVE_DIR = "results/20250602_101735/validation_samples"  # directory for .png outputs
+SAVE_DIR = "results/20250620_082708/validation_samples"  # directory for .png outputs
 ETA = 0.0  # DDIM eta; 0 ⇒ deterministic, >0 ⇒ stochastic
 NUM_CLASSES = 11  # <-- Set this to match your training
 # ------------------------------------------------------------ #
@@ -47,21 +47,25 @@ np.random.seed(42)
 np.random.shuffle(indices)
 split = int(0.9 * total_size)
 val_indices = indices[split:]
-dataset = LRHRDataSet(mode="val", indices=val_indices)
+dataset = LRHRDataSet(mode="val", indices=val_indices, augment=False)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 print(f"Validation dataset size: {len(dataset)} samples")
 
+def denormalize(img, mean, std):
+    return img * std + mean
+
 # Compute min and max over the whole validation dataset (HR channel)
-hr_min, hr_max = float("inf"), float("-inf")
+hr_global_min, hr_global_max = float("inf"), float("-inf")
 for batch in dataloader:
     _, im_hr, _, _, _ = [t for t in batch]
-    batch_min = im_hr.min().item()
-    batch_max = im_hr.max().item()
-    if batch_min < hr_min:
-        hr_min = batch_min
-    if batch_max > hr_max:
-        hr_max = batch_max
-print(f"[INFO] HR data range over validation set: min={hr_min}, max={hr_max}")
+    im_hr_denorm = denormalize(im_hr, dataset._means[1], dataset._stds[1])  # denormalize HR
+    batch_min = im_hr_denorm.min().item()
+    batch_max = im_hr_denorm.max().item()
+    if batch_min < hr_global_min:
+        hr_global_min = batch_min
+    if batch_max > hr_global_max:
+        hr_global_max = batch_max
+print(f"[INFO] HR data range over validation set: min={hr_global_min}, max={hr_global_max}")
 
 # ----------------- MODEL + SCHEDULER ------------------------ #
 print("[INFO] Building model …")
@@ -123,10 +127,6 @@ model.eval()
 def lr_to_embedding(lr_up: torch.Tensor):
     b, c, h, w = lr_up.shape
     return lr_up.view(b, c, h * w).permute(0, 2, 1).to(DEVICE)
-
-
-def denormalize(img, mean, std):
-    return img * std + mean
 
 
 def onehot_spatial(cond_lc, num_classes, device):
@@ -208,16 +208,29 @@ with torch.no_grad():
         im_lr_denorm = denormalize(im_lr_cpu, means[0], stds[0])
         im_hr_denorm = denormalize(im_hr_cpu, means[1], stds[1])
 
+        # Compute the range for sr_denorm
+        sr_min = min(sr.min() for sr in sr_denorm)
+        sr_max = max(sr.max() for sr in sr_denorm)
+
+        # Compute the range for hr_denorm
+        hr_min = min(hr.min() for hr in im_hr_denorm)
+        hr_max = max(hr.max() for hr in im_hr_denorm)
+
+        # Take the min of both minimum values and the max of both maximum values
+        global_min = min(sr_min, hr_min)
+        global_max = max(sr_max, hr_max)
+
         # ------------- VISUALIZATION & SAVING --------------- #
         for i in range(sr.size(0)):
             fig, axs = plt.subplots(1, 3, figsize=(12, 4))
             axs[0].imshow(im_lr_denorm[i], cmap="viridis")
             axs[0].set_title("Low-Res (Input)")
 
-            axs[1].imshow(im_hr_denorm[i], cmap="viridis")
+            axs[1].imshow(im_hr_denorm[i], cmap="viridis", vmin=global_min, vmax=global_max)
             axs[1].set_title("High-Res (GT)")
 
-            axs[2].imshow(sr_denorm[i], cmap="viridis")
+            im = axs[2].imshow(sr_denorm[i], cmap="viridis", vmin=global_min, vmax=global_max)
+            plt.colorbar(im, ax=axs[2], label='Pixel Values')  # Associate the colorbar with the image plot
             axs[2].set_title("Reconstructed HR (DDIM)")
 
             # ---- Convert to numpy for metrics ----
@@ -233,8 +246,8 @@ with torch.no_grad():
             )
 
             # ---- Compute metrics ----
-            psnr = compute_psnr(hr_np, sr_np, data_range=hr_max - hr_min)
-            ssim = compute_ssim(hr_np, sr_np, data_range=hr_max - hr_min)
+            psnr = compute_psnr(hr_np, sr_np, data_range=hr_global_max - hr_global_min)
+            ssim = compute_ssim(hr_np, sr_np, data_range=hr_global_max - hr_global_min)
             scc = np.corrcoef(sr_np.flatten(), hr_np.flatten())[0, 1]
             mse = np.mean((sr_np - hr_np) ** 2)
 
