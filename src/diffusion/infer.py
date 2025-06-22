@@ -15,39 +15,36 @@ from diffusers import UNet2DConditionModel, DDIMScheduler, DDPMScheduler  # ← 
 from src.data.lrhr_dataset import LRHRDataSet  # make sure this module is import‑able
 
 # -------------------------- CONFIG -------------------------- #
-CKPT_PATH = "results/20250620_082708/checkpoints/best.pt"  # path to .pt checkpoint
+CKPT_PATH = "results/all_regions__no_angle__big_model/checkpoints/diff_sr_ep499.pt"  # path to .pt checkpoint
 BATCH_SIZE = 1  # dataloader batch size
 NUM_SAMPLES = 30  # number of LR‒HR pairs to run
-STEPS = 50  # DDIM inference steps
+STEPS = 15  # DDIM inference steps
 IMG_SIZE = 256  # UNet sample size
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAVE_DIR = "results/20250620_082708/validation_samples"  # directory for .png outputs
+SAVE_DIR = "results/all_regions__no_angle__big_model/validation_samples"  # directory for .png outputs
 ETA = 0.0  # DDIM eta; 0 ⇒ deterministic, >0 ⇒ stochastic
 NUM_CLASSES = 11  # <-- Set this to match your training
-# ------------------------------------------------------------ #
 
+# ----------------------------SET SEEDS and dirs ------------- #
+torch.manual_seed(42)
+np.random.seed(42)
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ------------------------- DATA ----------------------------- #
 print("[INFO] Loading dataset …")
-
-# Get total dataset and split into train/val using random_split with a fixed seed
-# full_dataset = LRHRDataSet(mode="val")
-# total_size = len(full_dataset)
-# split = int(0.9 * total_size)
-# lengths = [split, total_size - split]
-# generator = torch.Generator().manual_seed(42)
-# _, dataset = random_split(full_dataset, lengths, generator=generator)
-# dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
-full_dataset = LRHRDataSet(mode="train")
+full_dataset = LRHRDataSet(mode="train", data_root= "../sr_data")
 total_size = len(full_dataset)
 print(f"[INFO] Total dataset size: {total_size}")
+
 indices = np.arange(total_size)
-np.random.seed(42)
 np.random.shuffle(indices)
 split = int(0.9 * total_size)
+
+train_indices = indices[:split]
+dataset_train = LRHRDataSet(mode="train", data_root= "../sr_data", indices=train_indices, augment=False)
+
 val_indices = indices[split:]
-dataset = LRHRDataSet(mode="val", indices=val_indices, augment=False)
+dataset = LRHRDataSet(mode="val", data_root= "../sr_data",indices=val_indices, augment=False)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 print(f"Validation dataset size: {len(dataset)} samples")
 
@@ -58,7 +55,7 @@ def denormalize(img, mean, std):
 hr_global_min, hr_global_max = float("inf"), float("-inf")
 for batch in dataloader:
     _, im_hr, _, _, _ = [t for t in batch]
-    im_hr_denorm = denormalize(im_hr, dataset._means[1], dataset._stds[1])  # denormalize HR
+    im_hr_denorm = denormalize(im_hr, dataset_train._means[1], dataset_train._stds[1])  # denormalize HR
     batch_min = im_hr_denorm.min().item()
     batch_max = im_hr_denorm.max().item()
     if batch_min < hr_global_min:
@@ -82,11 +79,12 @@ print("[INFO] Building model …")
 
 model = UNet2DConditionModel(
     sample_size=IMG_SIZE,
-    in_channels=4 + NUM_CLASSES,  # HR noise + LR + one-hot + dem + ewc
+    in_channels=3 + NUM_CLASSES,  # HR noise + LR + one-hot + dem + ewc
     out_channels=1,
     layers_per_block=2,
     # block_out_channels=(64, 128, 256, 256),
     block_out_channels=(128, 256, 384, 512),
+   # block_out_channels=(64, 128, 192, 256),
     down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D"),
     up_block_types=("UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"),
     class_embed_type=None,
@@ -154,8 +152,8 @@ with torch.no_grad():
     # Get means and stds from dataset for denormalization
     # means = dataset.dataset._means
     # stds = dataset.dataset._stds
-    means = dataset._means
-    stds = dataset._stds
+    means = dataset_train._means
+    stds = dataset_train._stds
 
     psnr_list = []
     ssim_list = []
@@ -163,7 +161,7 @@ with torch.no_grad():
     mse_list = []
 
     for batch_idx, batch in enumerate(dataloader):
-        im_lr, im_hr, cond_angle, cond_lc, cond_dem = [
+        im_lr, im_hr, _, cond_lc, cond_dem = [
             t.to(DEVICE).float() for t in batch
         ]
 
@@ -175,7 +173,6 @@ with torch.no_grad():
 
         # Start from pure Gaussian noise having HR shape
         x = torch.randn_like(im_hr).to(DEVICE)
-
         # Conditioning from LR
         cond_emb = lr_to_embedding(im_lr)
 
@@ -183,7 +180,7 @@ with torch.no_grad():
         for t in scheduler.timesteps:
             t_batch = torch.full((x.shape[0],), t, device=DEVICE, dtype=torch.long)
             x_cond = torch.cat(
-                [x, im_lr, cond_angle, cond_lc_onehot, cond_dem_normed], dim=1
+                [x, im_lr, cond_lc_onehot, cond_dem_normed], dim=1
             )  # [B, 2+NUM_CLASSES, H, W]
             with autocast_ctx:
                 pred_noise = model(x_cond, t_batch, encoder_hidden_states=cond_emb)[
