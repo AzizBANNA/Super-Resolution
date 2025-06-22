@@ -11,7 +11,16 @@ np.random.seed(42)
 
 
 class LRHRDataSet(Dataset):
-    def __init__(self, data_root="sr_data", mode="train", indices=None, zscore=True, augment=True):
+    def __init__(
+        self,
+        data_root="sr_data",
+        mode="train",
+        indices=None,
+        zscore=True,
+        augment=True,
+        means=None,
+        stds=None,
+    ):
         self.mode = mode
         self.zscore = zscore
         self.augment = augment
@@ -44,9 +53,14 @@ class LRHRDataSet(Dataset):
 
         self.samples = []
         self.build_samples()
-        self.samples = np.array(self.samples if indices is None else np.array(self.samples)[indices])
+        self.samples = np.array(
+            self.samples if indices is None else np.array(self.samples)[indices]
+        )
 
-        if self.zscore:
+        if self.zscore and means is not None and stds is not None:
+            self._means = means
+            self._stds = stds
+        else:
             self._compute_zscore_stats()
 
     def extract_timestamp(self, filename):
@@ -95,7 +109,9 @@ class LRHRDataSet(Dataset):
         if rule is None:
             return img
         if "rows" in rule:
-            img = np.delete(img, np.arange(rule["rows"].start, rule["rows"].stop), axis=0)
+            img = np.delete(
+                img, np.arange(rule["rows"].start, rule["rows"].stop), axis=0
+            )
         if "cols" in rule:
             img = np.delete(img, rule["cols"], axis=1)
         return img

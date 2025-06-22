@@ -18,7 +18,7 @@ from src.data.lrhr_dataset import LRHRDataSet  # make sure this module is import
 CKPT_PATH = "results/all_regions__no_angle__big_model/checkpoints/diff_sr_ep499.pt"  # path to .pt checkpoint
 BATCH_SIZE = 1  # dataloader batch size
 NUM_SAMPLES = 30  # number of LR‒HR pairs to run
-STEPS = 15  # DDIM inference steps
+STEPS = 50  # DDIM inference steps
 IMG_SIZE = 256  # UNet sample size
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SAVE_DIR = "results/all_regions__no_angle__big_model/validation_samples"  # directory for .png outputs
@@ -32,7 +32,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ------------------------- DATA ----------------------------- #
 print("[INFO] Loading dataset …")
-full_dataset = LRHRDataSet(mode="train", data_root= "../sr_data")
+full_dataset = LRHRDataSet(mode="train", data_root="../sr_data")
 total_size = len(full_dataset)
 print(f"[INFO] Total dataset size: {total_size}")
 
@@ -41,28 +41,43 @@ np.random.shuffle(indices)
 split = int(0.9 * total_size)
 
 train_indices = indices[:split]
-dataset_train = LRHRDataSet(mode="train", data_root= "../sr_data", indices=train_indices, augment=False)
+dataset_train = LRHRDataSet(
+    mode="train", data_root="../sr_data", indices=train_indices, augment=False
+)
 
 val_indices = indices[split:]
-dataset = LRHRDataSet(mode="val", data_root= "../sr_data",indices=val_indices, augment=False)
+dataset = LRHRDataSet(
+    mode="val",
+    data_root="../sr_data",
+    indices=val_indices,
+    augment=False,
+    means=dataset_train._means,
+    stds=dataset_train._stds,
+)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 print(f"Validation dataset size: {len(dataset)} samples")
 
+
 def denormalize(img, mean, std):
     return img * std + mean
+
 
 # Compute min and max over the whole validation dataset (HR channel)
 hr_global_min, hr_global_max = float("inf"), float("-inf")
 for batch in dataloader:
     _, im_hr, _, _, _ = [t for t in batch]
-    im_hr_denorm = denormalize(im_hr, dataset_train._means[1], dataset_train._stds[1])  # denormalize HR
+    im_hr_denorm = denormalize(
+        im_hr, dataset_train._means[1], dataset_train._stds[1]
+    )  # denormalize HR
     batch_min = im_hr_denorm.min().item()
     batch_max = im_hr_denorm.max().item()
     if batch_min < hr_global_min:
         hr_global_min = batch_min
     if batch_max > hr_global_max:
         hr_global_max = batch_max
-print(f"[INFO] HR data range over validation set: min={hr_global_min}, max={hr_global_max}")
+print(
+    f"[INFO] HR data range over validation set: min={hr_global_min}, max={hr_global_max}"
+)
 
 # ----------------- MODEL + SCHEDULER ------------------------ #
 print("[INFO] Building model …")
@@ -84,7 +99,7 @@ model = UNet2DConditionModel(
     layers_per_block=2,
     # block_out_channels=(64, 128, 256, 256),
     block_out_channels=(128, 256, 384, 512),
-   # block_out_channels=(64, 128, 192, 256),
+    # block_out_channels=(64, 128, 192, 256),
     down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D"),
     up_block_types=("UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"),
     class_embed_type=None,
@@ -223,11 +238,17 @@ with torch.no_grad():
             axs[0].imshow(im_lr_denorm[i], cmap="viridis")
             axs[0].set_title("Low-Res (Input)")
 
-            axs[1].imshow(im_hr_denorm[i], cmap="viridis", vmin=global_min, vmax=global_max)
+            axs[1].imshow(
+                im_hr_denorm[i], cmap="viridis", vmin=global_min, vmax=global_max
+            )
             axs[1].set_title("High-Res (GT)")
 
-            im = axs[2].imshow(sr_denorm[i], cmap="viridis", vmin=global_min, vmax=global_max)
-            plt.colorbar(im, ax=axs[2], label='Pixel Values')  # Associate the colorbar with the image plot
+            im = axs[2].imshow(
+                sr_denorm[i], cmap="viridis", vmin=global_min, vmax=global_max
+            )
+            plt.colorbar(
+                im, ax=axs[2], label="Pixel Values"
+            )  # Associate the colorbar with the image plot
             axs[2].set_title("Reconstructed HR (DDIM)")
 
             # ---- Convert to numpy for metrics ----
