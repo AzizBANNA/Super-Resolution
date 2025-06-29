@@ -10,20 +10,21 @@ import numpy as np
 from contextlib import nullcontext
 from skimage.metrics import peak_signal_noise_ratio as compute_psnr
 from skimage.metrics import structural_similarity as compute_ssim
+from collections import defaultdict
 
 from diffusers import UNet2DConditionModel, DDIMScheduler, DDPMScheduler  # ← DDIM!
 from src.data.lrhr_dataset import LRHRDataSet  # make sure this module is import‑able
 
 # -------------------------- CONFIG -------------------------- #
-CKPT_PATH = "results/all_regions__no_angle__big_model/checkpoints/diff_sr_ep499.pt"  # path to .pt checkpoint
+CKPT_PATH = "results/all_regions__no__angle__big_model__1000_epochs/checkpoints/diff_sr_ep999.pt"  # path to .pt checkpoint
 BATCH_SIZE = 1  # dataloader batch size
 NUM_SAMPLES = 30  # number of LR‒HR pairs to run
 STEPS = 50  # DDIM inference steps
 IMG_SIZE = 256  # UNet sample size
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAVE_DIR = "results/all_regions__no_angle__big_model/validation_samples"  # directory for .png outputs
+SAVE_DIR = "results/all_regions__no__angle__big_model__1000_epochs/validation_samples"  # directory for .png outputs
 ETA = 0.0  # DDIM eta; 0 ⇒ deterministic, >0 ⇒ stochastic
-NUM_CLASSES = 11  # <-- Set this to match your training
+NUM_CLASSES = 9  # <-- Set this to match your training
 
 # ----------------------------SET SEEDS and dirs ------------- #
 torch.manual_seed(42)
@@ -57,6 +58,11 @@ dataset = LRHRDataSet(
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 print(f"Validation dataset size: {len(dataset)} samples")
 
+# dataset_train = LRHRDataSet(data_root="../sr_data_train", mode="train", augment=False)
+# val_dataset = LRHRDataSet(data_root="../sr_data_val", mode="val", augment=False)
+# dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+# print(f"[INFO] Train dataset size: {len(dataset_train)}")
+# print(f"[INFO] Validation dataset size: {len(val_dataset)}")
 
 def denormalize(img, mean, std):
     return img * std + mean
@@ -65,7 +71,7 @@ def denormalize(img, mean, std):
 # Compute min and max over the whole validation dataset (HR channel)
 hr_global_min, hr_global_max = float("inf"), float("-inf")
 for batch in dataloader:
-    _, im_hr, _, _, _ = [t for t in batch]
+    _, im_hr, _, _, _, _ = [t for t in batch]
     im_hr_denorm = denormalize(
         im_hr, dataset_train._means[1], dataset_train._stds[1]
     )  # denormalize HR
@@ -175,9 +181,12 @@ with torch.no_grad():
     scc_list = []
     mse_list = []
 
+    # Initialize dictionaries to store metrics per region
+    region_metrics = defaultdict(lambda: {"psnr": [], "ssim": [], "scc": [], "mse": []})
+
     for batch_idx, batch in enumerate(dataloader):
-        im_lr, im_hr, _, cond_lc, cond_dem = [
-            t.to(DEVICE).float() for t in batch
+        im_lr, im_hr, _, cond_lc, cond_dem, region_timestamp = [
+            t.to(DEVICE).float() if isinstance(t, torch.Tensor) else t for t in batch
         ]
 
         # One-hot encode cond_lc
@@ -234,22 +243,45 @@ with torch.no_grad():
 
         # ------------- VISUALIZATION & SAVING --------------- #
         for i in range(sr.size(0)):
-            fig, axs = plt.subplots(1, 3, figsize=(12, 4))
-            axs[0].imshow(im_lr_denorm[i], cmap="viridis")
-            axs[0].set_title("Low-Res (Input)")
+            fig = plt.figure(figsize=(16, 4))  # Increase width to accommodate histogram
+            from matplotlib.gridspec import GridSpec
 
-            axs[1].imshow(
+            # Adjust GridSpec to include space for the histogram
+            gs = GridSpec(1, 4, width_ratios=[1, 1, 1, 1])  # Remove separate colorbar column
+
+            axs = [fig.add_subplot(gs[j]) for j in range(3)]
+            hist_ax = fig.add_subplot(gs[3])  # Dedicated axis for the histogram
+
+            lr = axs[0].imshow(im_lr_denorm[i], cmap="viridis")
+            axs[0].set_title("LR")
+
+            hr = axs[1].imshow(
                 im_hr_denorm[i], cmap="viridis", vmin=global_min, vmax=global_max
             )
-            axs[1].set_title("High-Res (GT)")
+            axs[1].set_title("GT HR")
 
-            im = axs[2].imshow(
+            rec = axs[2].imshow(
                 sr_denorm[i], cmap="viridis", vmin=global_min, vmax=global_max
             )
-            plt.colorbar(
-                im, ax=axs[2], label="Pixel Values"
-            )  # Associate the colorbar with the image plot
-            axs[2].set_title("Reconstructed HR (DDIM)")
+            axs[2].set_title("Rec. HR")
+
+            # Add the colorbar directly to the reconstructed image plot
+            plt.colorbar(rec, ax=axs[2], fraction=0.046, pad=0.04)  # Adjust size and padding
+            plt.colorbar(hr, ax=axs[1], fraction=0.046, pad=0.04)  # Adjust size and padding
+            plt.colorbar(lr, ax=axs[0], fraction=0.046, pad=0.04)  # Adjust size and padding
+
+            # ---- Add histogram to the right ----
+            hist_ax.hist(im_hr_denorm[i].cpu().numpy().flatten(), bins=100, range=(global_min.cpu().numpy(), global_max.cpu().numpy()), alpha=0.5, label="GT HR")
+            hist_ax.hist(sr_denorm[i].cpu().numpy().flatten(), bins=100, range=(global_min.cpu().numpy(), global_max.cpu().numpy()), alpha=0.5, label="Rec. HR")
+            hist_ax.set_title("Pixel Value Histogram")
+            hist_ax.legend(loc="upper right", fontsize=8)  # Make legend smaller
+
+            # Remove y-axis from the histogram
+            hist_ax.yaxis.set_visible(False)
+            hist_ax.tick_params(axis="x", labelsize=8)  # Make x-axis ticks smaller
+
+            # Match the aspect ratio of the histogram to the HR image
+            hist_ax.set_box_aspect(1)  # Ensure the aspect ratio matches the HR image
 
             # ---- Convert to numpy for metrics ----
             hr_np = (
@@ -274,9 +306,20 @@ with torch.no_grad():
             scc_list.append(scc)
             mse_list.append(mse)
 
-            # Centralized subtitle with tab-separated metrics
+            # Split region_timestamp into region and timestamp, and remove .tif extension
+            region, timestamp = region_timestamp[i].split("/")
+            timestamp = timestamp.replace(".tif", "")
+
+            # Store metrics per region
+            region_metrics[region]["psnr"].append(psnr)
+            region_metrics[region]["ssim"].append(ssim)
+            region_metrics[region]["scc"].append(scc)
+            region_metrics[region]["mse"].append(mse)
+
+            # Centralized subtitle with region and timestamp on the first line, and metrics on the second line
             fig.suptitle(
-                f"PSNR: {psnr:.2f} dB   |   SSIM: {ssim:.3f}   |    SCC: {scc:.3f}   |   MSE: {mse:.4f}",
+                f"Region: {region}   |   Date: {timestamp}\n"
+                f"PSNR: {psnr:.2f} dB   |   SSIM: {ssim:.3f}   |   SCC: {scc:.3f}   |   MSE: {mse:.4f}",
                 fontsize=12,
                 y=0.98,
             )
@@ -290,8 +333,7 @@ with torch.no_grad():
             )
             plt.tight_layout(rect=[0, 0, 1, 0.95], pad=0.2, w_pad=0.01, h_pad=0.05)
 
-            fname = f"sample_{batch_idx}_{i}.png"
-            fpath = os.path.join(SAVE_DIR, fname)
+            fpath = os.path.join(SAVE_DIR, f"{region}_{timestamp}.png")
             fig.savefig(fpath, bbox_inches="tight")
             plt.close(fig)
             print(f"[INFO] Saved → {fpath}")
@@ -301,5 +343,26 @@ with torch.no_grad():
     print(f"[RESULT] Average SSIM: {np.mean(ssim_list):.4f}")
     print(f"[RESULT] Average SCC: {np.mean(scc_list):.4f}")
     print(f"[RESULT] Average MSE: {np.mean(mse_list):.4f}")
+
+    # Compute average metrics per region
+    print("\n[RESULT] Metrics per region:")
+    for region, metrics in region_metrics.items():
+        avg_psnr = np.mean(metrics["psnr"])
+        avg_ssim = np.mean(metrics["ssim"])
+        avg_scc = np.mean(metrics["scc"])
+        avg_mse = np.mean(metrics["mse"])
+        print(f"Region: {region}")
+        print(f"  Average PSNR: {avg_psnr:.2f} dB")
+        print(f"  Average SSIM: {avg_ssim:.4f}")
+        print(f"  Average SCC: {avg_scc:.4f}")
+        print(f"  Average MSE: {avg_mse:.4f}")
+
+    # Convert defaultdict to regular dict before saving
+    region_metrics_dict = dict(region_metrics)
+
+    # Save region_metrics dictionary as a .npy file
+    metrics_save_path = os.path.join(SAVE_DIR, "region_metrics.npy")
+    np.save(metrics_save_path, region_metrics_dict)
+    print(f"[INFO] Saved region metrics dictionary to {metrics_save_path}")
 
 print("[DONE] All figures written to", os.path.abspath(SAVE_DIR))

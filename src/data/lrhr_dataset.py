@@ -192,4 +192,8 @@ class LRHRDataSet(Dataset):
             im_lc = self.zscore_normalize(im_lc, 3)
             im_dem = self.zscore_normalize(im_dem, 4)
 
-        return im_lr[None], im_hr[None], im_angle[None], im_lc[None], im_dem[None]
+        # Extract region and timestamp from LR path
+        lr_filename = os.path.basename(lr_path)
+        region_timestamp = f"{region}/{lr_filename}"
+
+        return im_lr[None], im_hr[None], im_angle[None], im_lc[None], im_dem[None], region_timestamp

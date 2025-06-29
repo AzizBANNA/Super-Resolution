@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler
 from accelerate import Accelerator
@@ -20,16 +20,16 @@ import datetime
 np.random.seed(42)  # For reproducibility
 
 # ------------------------- hyperparameters ------------------------- #
-NUM_EPOCHS = 500
+NUM_EPOCHS = 1000
 SAVE_FREQ = 50
 BATCH_SIZE = 4
-LR = 5e-5
+LR = 1e-4
 LOG_PATH = "results/diffusion_train_logs"
 CKPT_DIR = "results/diffusion_baseline_checkpoints"
 IMG_SIZE_HR = 256
 USE_MIXED_PREC = True
 
-NUM_CLASSES = 11  # <-- Set this to your number of classes
+NUM_CLASSES = 9  # <-- Set this to your number of classes
 
 
 # ------------------------- helpers ------------------------- #
@@ -84,17 +84,22 @@ class DiffusionSRTrainer:
         self.log_path = os.path.join(self.results_dir, "diffusion_train_logs")
 
         # Get total dataset and split into train/val using random_split with a fixed seed
-        full_dataset = LRHRDataSet(mode="train")
-        total_size = len(full_dataset)
-        print(f"[INFO] Total dataset size: {total_size}")
-        indices = np.arange(total_size)
-        np.random.seed(42)
-        np.random.shuffle(indices)
-        split = int(0.9 * total_size)
-        train_indices, val_indices = indices[:split], indices[split:]
+        # full_dataset = LRHRDataSet(data_root="../sr_data", mode="train")
+        # total_size = len(full_dataset)
+        # print(f"[INFO] Total dataset size: {total_size}")
+        # indices = np.arange(total_size)
+        # np.random.seed(42)
+        # np.random.shuffle(indices)
+        # split = int(0.9 * total_size)
+        # train_indices, val_indices = indices[:split], indices[split:]
 
-        train_dataset = LRHRDataSet(mode="train", indices=train_indices)
-        val_dataset = LRHRDataSet(mode="val", indices=val_indices)
+        # train_dataset = LRHRDataSet(data_root="../sr_data", mode="train", indices=train_indices, augment=False)
+        # val_dataset = LRHRDataSet(data_root="../sr_data", mode="val", indices=val_indices, augment=False)
+
+        train_dataset = LRHRDataSet(data_root="../sr_data_train_temporal", mode="train", augment=False)
+        val_dataset = LRHRDataSet(data_root="../sr_data_val_temporal", mode="val", augment=False)
+        print(f"[INFO] Train dataset size: {len(train_dataset)}")
+        print(f"[INFO] Validation dataset size: {len(val_dataset)}")
 
         self.train_loader = DataLoader(
             train_dataset,
@@ -111,13 +116,13 @@ class DiffusionSRTrainer:
             pin_memory=True,
         )
 
-        # Update in_channels: 1 (noisy LR) + 1 (LR) + NUM_CLASSES (one-hot)
+        # Update in_channels: 1 (noisy LR) + 1 (LR) + NUM_CLASSES (one-hot) + DEM
         self.model = UNet2DConditionModel(
             sample_size=IMG_SIZE_HR,
-            in_channels=4 + NUM_CLASSES,  # noisy LR + LR + one-hot + DEM + IncAngle
+            in_channels=3 + NUM_CLASSES,  # noisy LR + LR + one-hot + DEM
             out_channels=1,
             layers_per_block=2,
-            # block_out_channels=(64, 128, 256, 256),
+            # block_out_channels=(64, 128, 192, 256),
             block_out_channels=(128, 256, 384, 512),
             down_block_types=(
                 "DownBlock2D",
@@ -158,7 +163,7 @@ class DiffusionSRTrainer:
                 self.lr_scheduler.step()
 
     def train_step(self, batch):
-        im_lr, im_hr, cond_angle, cond_lc, cond_dem = batch
+        im_lr, im_hr, _, cond_lc, cond_dem, _ = batch  # Ignore cond_angle
         im_lr = im_lr.to(self.device).float()
         im_hr = im_hr.to(self.device).float()
         cond_lc = cond_lc.to(self.device)
@@ -178,8 +183,8 @@ class DiffusionSRTrainer:
         cond_dem_normed = (cond_dem - 200) / 100
 
         x_t_cond = torch.cat(
-            [x_t, im_lr, cond_angle, cond_lc_onehot, cond_dem_normed], dim=1
-        )  # [B, 2+1+NUM_CLASSES+1, H, W]
+            [x_t, im_lr, cond_lc_onehot, cond_dem_normed], dim=1
+        )  # [B, 2+NUM_CLASSES+1, H, W]
 
         cond_emb = lr_to_embedding(im_lr)
 
@@ -197,17 +202,30 @@ class DiffusionSRTrainer:
     def run(self):
         for self.epoch in range(self.epoch, NUM_EPOCHS):
             self.model.train()
-            pbar = tqdm(self.train_loader)
+            pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
+
+            # Accumulate loss for the epoch
+            epoch_loss = 0.0
+            num_batches = 0
+
             for batch in pbar:
                 loss = self.train_step(batch)
-                pbar.set_description(f"Epoch {self.epoch} | Loss: {loss.item():.4f}")
+                epoch_loss += loss.item()
+                num_batches += 1
+
+                # Update tqdm description with average loss so far
+                avg_loss = epoch_loss / num_batches
+                pbar.set_description(f"Epoch {self.epoch} | Avg Loss: {avg_loss:.4f}")
+
                 if self.step % 50 == 0:
                     self.writer.add_scalar("train/loss", loss.item(), self.step)
                 self.step += 1
+
             # Validation after each epoch
-            val_loss = self.validate()
-            # Print val loss after epoch
-            tqdm.write(f"Epoch {self.epoch} | Validation Loss: {val_loss:.4f}")
+            if self.epoch % 10 == 0 or self.epoch == NUM_EPOCHS - 1:
+                val_loss = self.validate()
+                tqdm.write(f"Epoch {self.epoch} | Validation Loss: {val_loss:.4f}")
+
             # Save best checkpoint
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
@@ -247,11 +265,15 @@ class DiffusionSRTrainer:
         self.model.eval()
         total_loss = 0.0
         count = 0
+
         for batch in self.val_loader:
-            im_lr, im_hr, cond_angle, cond_lc, cond_dem = [
-                t.to(self.device) for t in batch
-            ]
+            im_lr, im_hr, _, cond_lc, cond_dem, _ = batch
+            im_lr.to(self.device)
+            im_hr.to(self.device)
+            cond_lc.to(self.device)
+            cond_dem.to(self.device)
             sanity_check(im_lr, im_hr)
+
             cond_lc_onehot = onehot_spatial(cond_lc, NUM_CLASSES, self.device)
             cond_dem_normed = (cond_dem - 200) / 100
 
@@ -263,17 +285,20 @@ class DiffusionSRTrainer:
             x_t = self.scheduler.add_noise(im_hr, noise, t)
 
             x_t_cond = torch.cat(
-                [x_t, im_lr, cond_angle, cond_lc_onehot, cond_dem_normed], dim=1
+                [x_t, im_lr, cond_lc_onehot, cond_dem_normed], dim=1
             )
             cond_emb = lr_to_embedding(im_lr)
-            pred = self.model(
+
+            # Predict noise
+            pred_noise = self.model(
                 x_t_cond,
                 t,
                 encoder_hidden_states=cond_emb,
             )["sample"]
-            loss = F.mse_loss(pred, noise, reduction="mean")
+            loss = F.mse_loss(pred_noise, noise, reduction="mean")
             total_loss += loss.item() * im_hr.size(0)
             count += im_hr.size(0)
+
         self.model.train()
         return total_loss / count if count > 0 else 0.0
 
@@ -285,7 +310,7 @@ class DiffusionSRTrainer:
 
         loader = self.val_loader if split == "val" else self.train_loader
         batch = next(iter(loader))
-        im_lr, im_hr, cond_angle, cond_lc, cond_dem = [t.to(self.device) for t in batch]
+        im_lr, im_hr, _, cond_lc, cond_dem, _ = [t.to(self.device) for t in batch]  # Ignore cond_angle
         sanity_check(im_lr, im_hr)
 
         cond_lc_onehot = onehot_spatial(cond_lc, NUM_CLASSES, self.device)
@@ -298,7 +323,7 @@ class DiffusionSRTrainer:
 
         for t in tqdm(sampler.timesteps):
             latents_cond = torch.cat(
-                [latents, im_lr, cond_angle, cond_lc_onehot, cond_dem_normed], dim=1
+                [latents, im_lr, cond_lc_onehot, cond_dem_normed], dim=1
             )  # [B, 2+NUM_CLASSES+1, H, W]
             noise_pred = self.model(
                 sample=latents_cond, timestep=t, encoder_hidden_states=cond_emb
