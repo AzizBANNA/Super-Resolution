@@ -1,6 +1,6 @@
-# Diffusion-based RGB super-resolution trainer with DDIM sampling
+# Conditional diffusion trainer for single-channel (VV) super-resolution,
+# conditioned on LR, land cover (one-hot) and DEM. Samples with DDIM at the end.
 
-from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -24,12 +24,10 @@ NUM_EPOCHS = 1000
 SAVE_FREQ = 50
 BATCH_SIZE = 4
 LR = 1e-4
-LOG_PATH = "results/diffusion_train_logs"
-CKPT_DIR = "results/diffusion_baseline_checkpoints"
 IMG_SIZE_HR = 256
 USE_MIXED_PREC = True
 
-NUM_CLASSES = 9  # <-- Set this to your number of classes
+NUM_CLASSES = 9  # number of land cover classes
 
 
 # ------------------------- helpers ------------------------- #
@@ -70,7 +68,7 @@ def onehot_spatial(cond_lc, num_classes, device):
 
 # ------------------------- trainer ------------------------- #
 class DiffusionSRTrainer:
-    def __init__(self, resume_ckpt=None):
+    def __init__(self, train_root, val_root, resume_ckpt=None):
         self.acc = build_accelerator()
         self.device = self.acc.device
 
@@ -83,21 +81,16 @@ class DiffusionSRTrainer:
         os.makedirs(self.outputs_dir, exist_ok=True)
         self.log_path = os.path.join(self.results_dir, "diffusion_train_logs")
 
-        # Get total dataset and split into train/val using random_split with a fixed seed
-        # full_dataset = LRHRDataSet(data_root="../sr_data", mode="train")
-        # total_size = len(full_dataset)
-        # print(f"[INFO] Total dataset size: {total_size}")
-        # indices = np.arange(total_size)
-        # np.random.seed(42)
-        # np.random.shuffle(indices)
-        # split = int(0.9 * total_size)
-        # train_indices, val_indices = indices[:split], indices[split:]
-
-        # train_dataset = LRHRDataSet(data_root="../sr_data", mode="train", indices=train_indices, augment=False)
-        # val_dataset = LRHRDataSet(data_root="../sr_data", mode="val", indices=val_indices, augment=False)
-
-        train_dataset = LRHRDataSet(data_root="../sr_data_train_temporal", mode="train", augment=False)
-        val_dataset = LRHRDataSet(data_root="../sr_data_val_temporal", mode="val", augment=False)
+        # Separate train / val folders (e.g. a temporal split).
+        # The val set is normalized with the train set's statistics.
+        train_dataset = LRHRDataSet(data_root=train_root, mode="train", augment=False)
+        val_dataset = LRHRDataSet(
+            data_root=val_root,
+            mode="val",
+            augment=False,
+            means=train_dataset._means,
+            stds=train_dataset._stds,
+        )
         print(f"[INFO] Train dataset size: {len(train_dataset)}")
         print(f"[INFO] Validation dataset size: {len(val_dataset)}")
 
@@ -116,13 +109,11 @@ class DiffusionSRTrainer:
             pin_memory=True,
         )
 
-        # Update in_channels: 1 (noisy LR) + 1 (LR) + NUM_CLASSES (one-hot) + DEM
         self.model = UNet2DConditionModel(
             sample_size=IMG_SIZE_HR,
-            in_channels=3 + NUM_CLASSES,  # noisy LR + LR + one-hot + DEM
+            in_channels=3 + NUM_CLASSES,  # noisy HR + LR + DEM + one-hot land cover
             out_channels=1,
             layers_per_block=2,
-            # block_out_channels=(64, 128, 192, 256),
             block_out_channels=(128, 256, 384, 512),
             down_block_types=(
                 "DownBlock2D",
@@ -221,15 +212,14 @@ class DiffusionSRTrainer:
                     self.writer.add_scalar("train/loss", loss.item(), self.step)
                 self.step += 1
 
-            # Validation after each epoch
+            # Validate every 10 epochs and keep the best checkpoint
             if self.epoch % 10 == 0 or self.epoch == NUM_EPOCHS - 1:
                 val_loss = self.validate()
                 tqdm.write(f"Epoch {self.epoch} | Validation Loss: {val_loss:.4f}")
-
-            # Save best checkpoint
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.save_ckpt(best=True)
+                self.writer.add_scalar("val/loss", val_loss, self.epoch)
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    self.save_ckpt(best=True)
             # Save every SAVE_FREQ epochs
             if (self.epoch + 1) % SAVE_FREQ == 0:
                 self.save_ckpt()
@@ -268,10 +258,10 @@ class DiffusionSRTrainer:
 
         for batch in self.val_loader:
             im_lr, im_hr, _, cond_lc, cond_dem, _ = batch
-            im_lr.to(self.device)
-            im_hr.to(self.device)
-            cond_lc.to(self.device)
-            cond_dem.to(self.device)
+            im_lr = im_lr.to(self.device).float()
+            im_hr = im_hr.to(self.device).float()
+            cond_lc = cond_lc.to(self.device)
+            cond_dem = cond_dem.to(self.device)
             sanity_check(im_lr, im_hr)
 
             cond_lc_onehot = onehot_spatial(cond_lc, NUM_CLASSES, self.device)
@@ -310,7 +300,11 @@ class DiffusionSRTrainer:
 
         loader = self.val_loader if split == "val" else self.train_loader
         batch = next(iter(loader))
-        im_lr, im_hr, _, cond_lc, cond_dem, _ = [t.to(self.device) for t in batch]  # Ignore cond_angle
+        im_lr, im_hr, _, cond_lc, cond_dem, _ = batch  # ignore angle and region names
+        im_lr = im_lr.to(self.device).float()
+        im_hr = im_hr.to(self.device).float()
+        cond_lc = cond_lc.to(self.device)
+        cond_dem = cond_dem.to(self.device)
         sanity_check(im_lr, im_hr)
 
         cond_lc_onehot = onehot_spatial(cond_lc, NUM_CLASSES, self.device)
@@ -369,6 +363,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--train_root", default="sr_data_train", help="Training data folder")
+    parser.add_argument("--val_root", default="sr_data_val", help="Validation data folder")
     parser.add_argument(
         "--resume_ckpt",
         type=str,
@@ -377,5 +373,5 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    trainer = DiffusionSRTrainer(resume_ckpt=args.resume_ckpt)
+    trainer = DiffusionSRTrainer(args.train_root, args.val_root, resume_ckpt=args.resume_ckpt)
     trainer.run()

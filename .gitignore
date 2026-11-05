@@ -176,3 +176,12 @@ cython_debug/
 # Dataset
 sr_data
 results
+sr_data*/
+sanity_plots*/
+*.pt
+*.ckpt
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

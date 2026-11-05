@@ -1,11 +1,11 @@
-# Diffusion-based RGB super-resolution trainer with DDIM sampling (Dual-channel VV+VH version)
+# Conditional diffusion trainer for dual-channel (VV + VH) super-resolution,
+# conditioned on LR, incidence angle, land cover (one-hot) and DEM.
 
-from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler
 from accelerate import Accelerator
@@ -24,13 +24,11 @@ NUM_EPOCHS = 500
 SAVE_FREQ = 50
 BATCH_SIZE = 6
 LR = 5e-5
-LOG_PATH = "results/diffusion_train_logs"
-CKPT_DIR = "results/diffusion_baseline_checkpoints"
 IMG_SIZE_HR = 256
 USE_MIXED_PREC = True
 
-NUM_CLASSES = 9  # 
-HR_CHANNELS = 2  # <-- VV + VH
+NUM_CLASSES = 9  # number of land cover classes
+HR_CHANNELS = 2  # VV + VH
 
 
 # ------------------------- helpers ------------------------- #
@@ -64,7 +62,7 @@ def onehot_spatial(cond_lc, num_classes, device):
 
 # ------------------------- trainer ------------------------- #
 class DiffusionSRTrainer:
-    def __init__(self, resume_ckpt=None):
+    def __init__(self, data_root="sr_data", resume_ckpt=None):
         self.acc = build_accelerator()
         self.device = self.acc.device
 
@@ -78,7 +76,8 @@ class DiffusionSRTrainer:
         self.log_path = os.path.join(self.results_dir, "diffusion_train_logs")
 
         # ========== dataset ==========
-        full_dataset = LRHRDataSet(mode="train")
+        # Random 90/10 split; val is normalized with the train set's statistics
+        full_dataset = LRHRDataSet(data_root=data_root, mode="train", zscore=False)
         total_size = len(full_dataset)
         print(f"[INFO] Total dataset size: {total_size}")
         indices = np.arange(total_size)
@@ -87,8 +86,14 @@ class DiffusionSRTrainer:
         split = int(0.9 * total_size)
         train_indices, val_indices = indices[:split], indices[split:]
 
-        train_dataset = LRHRDataSet(mode="train", indices=train_indices)
-        val_dataset = LRHRDataSet(mode="val", indices=val_indices)
+        train_dataset = LRHRDataSet(data_root=data_root, mode="train", indices=train_indices)
+        val_dataset = LRHRDataSet(
+            data_root=data_root,
+            mode="val",
+            indices=val_indices,
+            means=train_dataset._means,
+            stds=train_dataset._stds,
+        )
 
         self.train_loader = DataLoader(
             train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True
@@ -100,7 +105,7 @@ class DiffusionSRTrainer:
         # ========== model ==========
         self.model = UNet2DConditionModel(
             sample_size=IMG_SIZE_HR,
-            in_channels=HR_CHANNELS + 3 + NUM_CLASSES,
+            in_channels=HR_CHANNELS + 3 + NUM_CLASSES,  # noisy HR + LR + angle + DEM + one-hot
             out_channels=HR_CHANNELS,
             layers_per_block=2,
             block_out_channels=(128, 256, 384, 512),
@@ -138,6 +143,7 @@ class DiffusionSRTrainer:
         im_hr = torch.cat([im_hr_vv, im_hr_vh], dim=1)  # Stack to shape (B, 2, 256, 256)
         im_lr = im_lr.to(self.device).float()
         im_hr = im_hr.to(self.device).float()
+        cond_angle = cond_angle.to(self.device)
         cond_lc = cond_lc.to(self.device)
         cond_dem = cond_dem.to(self.device)
 
@@ -180,7 +186,7 @@ class DiffusionSRTrainer:
             if (self.epoch + 1) % SAVE_FREQ == 0:
                 self.save_ckpt()
             self.lr_scheduler.step()
-        s#elf.sample_ddim(split="val")
+        self.sample_ddim(split="val")
 
     def save_ckpt(self, best=False):
         os.makedirs(self.ckpt_dir, exist_ok=True)
@@ -207,7 +213,7 @@ class DiffusionSRTrainer:
         count = 0
         for batch in self.val_loader:
             im_lr, im_hr_vv, im_hr_vh, cond_angle, cond_lc, cond_dem = [t.to(self.device) for t in batch]
-            im_hr = torch.cat([im_hr_vv, im_hr_vh], dim=1) 
+            im_hr = torch.cat([im_hr_vv, im_hr_vh], dim=1)
             sanity_check(im_lr, im_hr)
             cond_lc_onehot = onehot_spatial(cond_lc, NUM_CLASSES, self.device)
             cond_dem_normed = (cond_dem - 200) / 100
@@ -234,7 +240,7 @@ class DiffusionSRTrainer:
         loader = self.val_loader if split == "val" else self.train_loader
         batch = next(iter(loader))
         im_lr, im_hr_vv, im_hr_vh, cond_angle, cond_lc, cond_dem = [t.to(self.device) for t in batch]
-        im_hr = torch.cat([im_hr_vv, im_hr_vh], dim=1) 
+        im_hr = torch.cat([im_hr_vv, im_hr_vh], dim=1)
         sanity_check(im_lr, im_hr)
 
         cond_lc_onehot = onehot_spatial(cond_lc, NUM_CLASSES, self.device)
@@ -256,7 +262,7 @@ class DiffusionSRTrainer:
             pred = latents[i].detach().cpu().numpy()
             gt = im_hr[i].detach().cpu().numpy()
             psnr_val = np.mean([
-                compute_psnr(gt[c], pred[c], data_range=gt[c].ptp()) for c in range(HR_CHANNELS)
+                compute_psnr(gt[c], pred[c], data_range=np.ptp(gt[c])) for c in range(HR_CHANNELS)
             ])
             total_psnr += psnr_val
 
@@ -283,9 +289,10 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", default="sr_data", help="Dataset folder")
     parser.add_argument("--resume_ckpt", type=str, default=None,
                         help="Path to checkpoint to resume from")
     args = parser.parse_args()
 
-    trainer = DiffusionSRTrainer(resume_ckpt=args.resume_ckpt)
+    trainer = DiffusionSRTrainer(data_root=args.data_root, resume_ckpt=args.resume_ckpt)
     trainer.run()

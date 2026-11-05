@@ -1,30 +1,39 @@
 # -----------------------------------------------------------
-# Inference script using DDIM sampling; saves figures to Test/
+# Inference for the single-channel (VV) model using DDIM sampling.
+# Saves one figure per validation sample plus per-region metrics.
 # -----------------------------------------------------------
 
+import argparse
 import os
 import torch
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, random_split
+from matplotlib.gridspec import GridSpec
+from torch.utils.data import DataLoader
 import numpy as np
 from contextlib import nullcontext
 from skimage.metrics import peak_signal_noise_ratio as compute_psnr
 from skimage.metrics import structural_similarity as compute_ssim
 from collections import defaultdict
 
-from diffusers import UNet2DConditionModel, DDIMScheduler, DDPMScheduler  # ← DDIM!
-from src.data.lrhr_dataset import LRHRDataSet  # make sure this module is import‑able
+from diffusers import UNet2DConditionModel, DDIMScheduler
+from src.data.lrhr_dataset import LRHRDataSet
 
 # -------------------------- CONFIG -------------------------- #
-CKPT_PATH = "results/all_regions__no__angle__big_model__1000_epochs/checkpoints/diff_sr_ep999.pt"  # path to .pt checkpoint
+parser = argparse.ArgumentParser()
+parser.add_argument("--ckpt", required=True, help="Path to .pt checkpoint")
+parser.add_argument("--data_root", default="sr_data", help="Dataset folder")
+parser.add_argument("--save_dir", default="results/validation_samples", help="Output folder")
+args = parser.parse_args()
+
+CKPT_PATH = args.ckpt
+DATA_ROOT = args.data_root
+SAVE_DIR = args.save_dir
 BATCH_SIZE = 1  # dataloader batch size
-NUM_SAMPLES = 30  # number of LR‒HR pairs to run
 STEPS = 50  # DDIM inference steps
 IMG_SIZE = 256  # UNet sample size
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAVE_DIR = "results/all_regions__no__angle__big_model__1000_epochs/validation_samples"  # directory for .png outputs
 ETA = 0.0  # DDIM eta; 0 ⇒ deterministic, >0 ⇒ stochastic
-NUM_CLASSES = 9  # <-- Set this to match your training
+NUM_CLASSES = 9  # must match training
 
 # ----------------------------SET SEEDS and dirs ------------- #
 torch.manual_seed(42)
@@ -33,7 +42,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ------------------------- DATA ----------------------------- #
 print("[INFO] Loading dataset …")
-full_dataset = LRHRDataSet(mode="train", data_root="../sr_data")
+full_dataset = LRHRDataSet(mode="train", data_root=DATA_ROOT, zscore=False)
 total_size = len(full_dataset)
 print(f"[INFO] Total dataset size: {total_size}")
 
@@ -43,13 +52,13 @@ split = int(0.9 * total_size)
 
 train_indices = indices[:split]
 dataset_train = LRHRDataSet(
-    mode="train", data_root="../sr_data", indices=train_indices, augment=False
+    mode="train", data_root=DATA_ROOT, indices=train_indices, augment=False
 )
 
 val_indices = indices[split:]
 dataset = LRHRDataSet(
     mode="val",
-    data_root="../sr_data",
+    data_root=DATA_ROOT,
     indices=val_indices,
     augment=False,
     means=dataset_train._means,
@@ -57,12 +66,6 @@ dataset = LRHRDataSet(
 )
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 print(f"Validation dataset size: {len(dataset)} samples")
-
-# dataset_train = LRHRDataSet(data_root="../sr_data_train", mode="train", augment=False)
-# val_dataset = LRHRDataSet(data_root="../sr_data_val", mode="val", augment=False)
-# dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-# print(f"[INFO] Train dataset size: {len(dataset_train)}")
-# print(f"[INFO] Validation dataset size: {len(val_dataset)}")
 
 def denormalize(img, mean, std):
     return img * std + mean
@@ -87,25 +90,12 @@ print(
 
 # ----------------- MODEL + SCHEDULER ------------------------ #
 print("[INFO] Building model …")
-# model = UNet2DConditionModel(
-#     sample_size=IMG_SIZE,
-#     in_channels=1,
-#     out_channels=1,
-#     layers_per_block=2,
-#     block_out_channels=(32, 64, 128),
-#     down_block_types=("DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
-#     up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D"),
-#     cross_attention_dim=3,
-# ).to(DEVICE)
-
 model = UNet2DConditionModel(
     sample_size=IMG_SIZE,
-    in_channels=3 + NUM_CLASSES,  # HR noise + LR + one-hot + dem + ewc
+    in_channels=3 + NUM_CLASSES,  # noisy HR + LR + DEM + one-hot land cover
     out_channels=1,
     layers_per_block=2,
-    # block_out_channels=(64, 128, 256, 256),
     block_out_channels=(128, 256, 384, 512),
-    # block_out_channels=(64, 128, 192, 256),
     down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D"),
     up_block_types=("UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"),
     class_embed_type=None,
@@ -117,8 +107,6 @@ scheduler = DDIMScheduler(
     beta_schedule="linear",  # matches DDPM default
     clip_sample=False,  # keep full dynamic range
 )
-
-# scheduler = DDPMScheduler(num_train_timesteps=1000)
 
 
 # Move scheduler buffers to the same device as the model
@@ -133,12 +121,6 @@ print("[INFO] Loading checkpoint …")
 checkpoint = torch.load(CKPT_PATH, map_location=DEVICE)
 model.load_state_dict(checkpoint["model"], strict=True)
 model.eval()
-
-# scheduler = DDIMScheduler.from_config(checkpoint["scheduler"])
-# scheduler.set_timesteps(STEPS, device=DEVICE)
-
-# scheduler = DDPMScheduler.from_config(checkpoint["scheduler"])
-# scheduler.set_timesteps(STEPS, device=DEVICE)
 
 # -------------------- HELPERS ------------------------------- #
 
@@ -170,9 +152,7 @@ scheduler.set_timesteps(STEPS, device=DEVICE)
 # -------------------- INFERENCE ----------------------------- #
 print("[INFO] Starting inference with DDIM …")
 with torch.no_grad():
-    # Get means and stds from dataset for denormalization
-    # means = dataset.dataset._means
-    # stds = dataset.dataset._stds
+    # Training set statistics, used for denormalization
     means = dataset_train._means
     stds = dataset_train._stds
 
@@ -244,7 +224,6 @@ with torch.no_grad():
         # ------------- VISUALIZATION & SAVING --------------- #
         for i in range(sr.size(0)):
             fig = plt.figure(figsize=(16, 4))  # Increase width to accommodate histogram
-            from matplotlib.gridspec import GridSpec
 
             # Adjust GridSpec to include space for the histogram
             gs = GridSpec(1, 4, width_ratios=[1, 1, 1, 1])  # Remove separate colorbar column

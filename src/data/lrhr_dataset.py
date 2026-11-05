@@ -29,7 +29,6 @@ class LRHRDataSet(Dataset):
         self.angle_root = os.path.join(data_root, "IncAngle")
         self.ewc_root = os.path.join(data_root, "EWC")
         self.dem_root = os.path.join(data_root, "DEM")
-        self.printed_regions = set()
 
         self.remove_rules = {
             "Nu621P2": {"rows": slice(0, 17), "cols": [255]},

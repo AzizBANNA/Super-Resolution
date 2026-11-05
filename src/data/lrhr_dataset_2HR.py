@@ -5,10 +5,6 @@ import rasterio
 import numpy as np
 import cv2
 from torch.utils.data import Dataset
-import os
-import matplotlib.pyplot as plt
-import numpy as np
-from src.data.lrhr_dataset_2HR import LRHRDataSet
 
 random.seed(42)
 np.random.seed(42)
@@ -21,7 +17,16 @@ class LRHRDataSet(Dataset):
       (LR, HR_VV, HR_VH, Angle, LC, DEM)
     """
 
-    def __init__(self, data_root="sr_data", mode="train", indices=None, zscore=True, augment=True):
+    def __init__(
+        self,
+        data_root="sr_data",
+        mode="train",
+        indices=None,
+        zscore=True,
+        augment=True,
+        means=None,
+        stds=None,
+    ):
         self.mode = mode
         self.zscore = zscore
         self.augment = augment
@@ -33,7 +38,6 @@ class LRHRDataSet(Dataset):
         self.angle_root = os.path.join(data_root, "IncAngle")
         self.ewc_root = os.path.join(data_root, "EWC")
         self.dem_root = os.path.join(data_root, "DEM")
-        self.printed_regions = set()
 
         self.remove_rules = {
             "Nu621P2": {"rows": slice(0, 17), "cols": [255]},
@@ -61,7 +65,11 @@ class LRHRDataSet(Dataset):
         if indices is not None:
             self.samples = [self.samples[i] for i in indices]
 
-        if self.zscore:
+        # Reuse the training set's statistics (e.g. for validation) when given
+        if self.zscore and means is not None and stds is not None:
+            self._means = means
+            self._stds = stds
+        elif self.zscore:
             self._compute_zscore_stats()
 
     @staticmethod
@@ -194,9 +202,9 @@ class LRHRDataSet(Dataset):
             im_dem = self._zscore_normalize(im_dem, 3 + len(im_hr_list))
 
         return (
-            im_lr[None],            
-            im_hr_list[0][None],  # HR VV -->New
-            im_hr_list[1][None],  # HR VH -->New
+            im_lr[None],
+            im_hr_list[0][None],  # HR VV
+            im_hr_list[1][None],  # HR VH
             im_angle[None],
             im_lc[None],
             im_dem[None],
@@ -213,10 +221,9 @@ class LRHRDataSet(Dataset):
         return img
 
 
-
-
-
 if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
     dataset = LRHRDataSet(data_root="sr_data", mode="train", zscore=False, augment=False)
     os.makedirs("sanity_plots_new_2HR", exist_ok=True)
 

@@ -1,7 +1,8 @@
 # -----------------------------------------------------------
-# Inference script using DDIM sampling for dual-channel HR (VV + VH)
+# Inference for the dual-channel (VV + VH) model using DDIM sampling.
 # -----------------------------------------------------------
 
+import argparse
 import os
 import torch
 import matplotlib.pyplot as plt
@@ -12,21 +13,26 @@ from skimage.metrics import peak_signal_noise_ratio as compute_psnr
 from skimage.metrics import structural_similarity as compute_ssim
 
 from diffusers import UNet2DConditionModel, DDIMScheduler
-from src.data.lrhr_dataset_2HR import LRHRDataSet  
-
+from src.data.lrhr_dataset_2HR import LRHRDataSet
 
 
 def denormalize(img, mean, std):
     return img * std + mean
 
-# -------------------------- CONFIG -------------------------- #
-DEVICE = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda")
 
-CKPT_PATH = "results/20250624_230941/checkpoints/best.pt" 
+# -------------------------- CONFIG -------------------------- #
+parser = argparse.ArgumentParser()
+parser.add_argument("--ckpt", required=True, help="Path to .pt checkpoint")
+parser.add_argument("--data_root", default="sr_data", help="Dataset folder")
+parser.add_argument("--save_dir", default="results/validation_samples_2HR", help="Output folder")
+args = parser.parse_args()
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CKPT_PATH = args.ckpt
 BATCH_SIZE = 1
 STEPS = 50
 IMG_SIZE = 256
-SAVE_DIR = "results/20250624_230941/validation_samples"
+SAVE_DIR = args.save_dir
 ETA = 0.0
 NUM_CLASSES = 9
 HR_CHANNELS = 2
@@ -35,14 +41,19 @@ HR_CHANNELS = 2
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 print("[INFO] Loading dataset …")
-full_dataset = LRHRDataSet(mode="train")
+# Same 90/10 split as training; normalize val with the train set's statistics
+full_dataset = LRHRDataSet(data_root=args.data_root, mode="train", zscore=False)
 total_size = len(full_dataset)
 indices = np.arange(total_size)
 np.random.seed(42)
 np.random.shuffle(indices)
 split = int(0.9 * total_size)
-val_indices = indices[split:]
-dataset = LRHRDataSet(mode="val", indices=val_indices)
+train_indices, val_indices = indices[:split], indices[split:]
+dataset_train = LRHRDataSet(data_root=args.data_root, mode="train", indices=train_indices, augment=False)
+means, stds = dataset_train._means, dataset_train._stds
+dataset = LRHRDataSet(
+    data_root=args.data_root, mode="val", indices=val_indices, means=means, stds=stds
+)
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
 print(f"Validation dataset size: {len(dataset)} samples")
 
@@ -54,21 +65,20 @@ vh_min, vh_max = float("inf"), float("-inf")
 for batch in dataloader:
     _, hr_vv, hr_vh, _, _, _ = [t.to(DEVICE).float() for t in batch]
 
-    hr_vv_denorm = denormalize(hr_vv, dataset._means[1], dataset._stds[1])  # VV stats
-    hr_vh_denorm = denormalize(hr_vh, dataset._means[2], dataset._stds[2])  # VH stats
+    hr_vv_denorm = denormalize(hr_vv, means[1], stds[1])  # VV stats
+    hr_vh_denorm = denormalize(hr_vh, means[2], stds[2])  # VH stats
 
     vv_min = min(vv_min, hr_vv_denorm.min().item())
     vv_max = max(vv_max, hr_vv_denorm.max().item())
     vh_min = min(vh_min, hr_vh_denorm.min().item())
     vh_max = max(vh_max, hr_vh_denorm.max().item())
-
-# print(f"[INFO] VV range: min={vv_min:.4f}, max={vv_max:.4f}")
-# print(f"[INFO] VH range: min={vh_min:.4f}, max={vh_max:.4f}")
+print(f"[INFO] VV range: min={vv_min:.4f}, max={vv_max:.4f}")
+print(f"[INFO] VH range: min={vh_min:.4f}, max={vh_max:.4f}")
 
 print("[INFO] Building model …")
 model = UNet2DConditionModel(
     sample_size=IMG_SIZE,
-    in_channels=HR_CHANNELS + 3 + NUM_CLASSES,
+    in_channels=HR_CHANNELS + 3 + NUM_CLASSES,  # noisy HR + LR + angle + DEM + one-hot
     out_channels=HR_CHANNELS,
     layers_per_block=2,
     block_out_channels=(128, 256, 384, 512),
@@ -100,9 +110,6 @@ def lr_to_embedding(lr_up):
     b, c, h, w = lr_up.shape
     return lr_up.view(b, c, h * w).permute(0, 2, 1).to(DEVICE)
 
-def denormalize(img, mean, std):
-    return img * std + mean
-
 def onehot_spatial(cond_lc, num_classes, device):
     cond_lc = (cond_lc / 10).to(torch.int64)
     return torch.nn.functional.one_hot(cond_lc.squeeze(1), num_classes=num_classes).permute(0, 3, 1, 2).float().to(device)
@@ -112,8 +119,6 @@ autocast_ctx = torch.autocast(device_type="cuda") if DEVICE.type == "cuda" else 
 # -------------------- INFERENCE ----------------------------- #
 print("[INFO] Starting inference with DDIM …")
 with torch.no_grad():
-    means = dataset._means
-    stds = dataset._stds
     psnr_list, ssim_list = [], []
 
     for batch_idx, batch in enumerate(dataloader):
@@ -128,21 +133,22 @@ with torch.no_grad():
         for t in scheduler.timesteps:
             t_batch = torch.full((x.shape[0],), t.item(), device=DEVICE, dtype=torch.long)
             x_cond = torch.cat([x, im_lr, cond_angle, cond_lc_onehot, cond_dem_normed], dim=1)
-            #print(f"[DEBUG] scheduler.timesteps device: {scheduler.timesteps.device}")
-            #print(f"[DEBUG] scheduler.alphas_cumprod device: {scheduler.alphas_cumprod.device}")
             with autocast_ctx:
                 pred_noise = model(x_cond, t_batch, encoder_hidden_states=cond_emb)["sample"]
             x = scheduler.step(pred_noise, t_batch, x, eta=ETA).prev_sample
 
-        # Clamp, move to CPU for plotting
+        # Move to CPU for plotting
         sr = x.cpu()
         im_lr_cpu = im_lr.cpu()
-        im_hr_cpu = torch.cat([hr_vv, hr_vh], dim=1).cpu()
+        im_hr_cpu = im_hr.cpu()
 
         # --------- DENORMALIZE for visualization --------------
-        sr_denorm = denormalize(sr, means[1], stds[1])
+        # Each HR channel uses its own stats: VV -> index 1, VH -> index 2
+        hr_mean = torch.tensor(means[1:3]).view(1, 2, 1, 1)
+        hr_std = torch.tensor(stds[1:3]).view(1, 2, 1, 1)
+        sr_denorm = denormalize(sr, hr_mean, hr_std)
         im_lr_denorm = denormalize(im_lr_cpu, means[0], stds[0])
-        im_hr_denorm = denormalize(im_hr_cpu, means[1], stds[1])
+        im_hr_denorm = denormalize(im_hr_cpu, hr_mean, hr_std)
 
         for i in range(sr.shape[0]):
             fig, axs = plt.subplots(1, HR_CHANNELS * 2 + 1, figsize=(18, 4))
